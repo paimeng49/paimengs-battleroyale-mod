@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.paimeng.battleroyale.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "LivingEntityMixin",
+    "MinecraftServerAccessor",
+    "MinecraftServerMixin",
+    "PlayerConnectionAccessor",
+    "PlayerManagerMixin",
+    "ServerPlayerAccessor",
+    "ServerWorldMixin",
+    "DimensionTypeMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

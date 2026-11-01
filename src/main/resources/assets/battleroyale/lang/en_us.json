@@ -1,0 +1,11 @@
+{
+  "key.battleroyale.ping": "Ping (single click: waypoint, double click: enemy)",
+  "key.battleroyale.full_map": "Open Fullscreen Map",
+  "key.battleroyale.parachute": "Parachute (flight phase)",
+  "category.battleroyale.map": "Battle Royale Map",
+  "category.battleroyale.game": "Battle Royale Gameplay",
+  "key.categories.battleroyale": "Battle Royale (Paimeng)",
+  "item.battleroyale.self_reviver": "Self Reviver",
+  "item.battleroyale.selection_tool": "Selection Tool",
+  "item.battleroyale.loot_tool": "Loot Point Tool"
+}

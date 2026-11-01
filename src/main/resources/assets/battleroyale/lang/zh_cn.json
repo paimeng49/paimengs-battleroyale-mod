@@ -1,0 +1,12 @@
+{
+  "key.battleroyale.ping": "标点（单击=标记地点，双击=标记敌人）",
+  "key.battleroyale.full_map": "打开全屏地图",
+  "key.battleroyale.parachute": "跳伞（航线阶段）",
+  "category.battleroyale.map": "大逃杀地图",
+  "category.battleroyale.game": "大逃杀玩法",
+  "key.categories.battleroyale": "大逃杀（Paimeng）",
+  "item.battleroyale.self_reviver": "自救器",
+  "item.battleroyale.selection_tool": "选区工具",
+  "item.battleroyale.loot_tool": "物资点工具",
+  "item.battleroyale.spawn_tool": "出生岛工具"
+}
