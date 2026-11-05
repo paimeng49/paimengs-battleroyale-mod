@@ -26,7 +26,9 @@ import java.util.UUID;
  * [有无队伍 boolean]
  *   ├─ false：后面没有字段（空快照，客户端清缓存）
  *   └─ true ：teamId UUID | teamNumber VarInt | leaderId UUID | match Boolean | split Boolean
- *             + count VarInt + count × (uuid UUID | number VarInt | name String | split Boolean)
+ *             + count VarInt
+ *             + count × (uuid UUID | number VarInt | name String | split Boolean | status VarInt)
+ *             （status：0=ALIVE / 1=DOWNED / 2=ELIMINATED，局内快照取自 DownedManager）
  * </pre>
  *
  * <p>只发装了本模组的客户端（{@link ServerPlayNetworking#canSend}），原版客户端不会被踢线。
@@ -78,11 +80,13 @@ public final class TeamSync {
         }
     }
 
-    /** Team（服务端大厅队对象）→ 网络快照；成员已按编号升序。 */
+    /** Team（服务端大厅队对象）→ 网络快照；成员按加入顺序，编号恒 0（[BR-NOLOBBYNUMBER] 大厅无编号）。 */
     public static TeamSyncPayload of(Team team) {
         List<TeamSyncPayload.Member> members = new ArrayList<>(team.size());
-        for (Team.Entry entry : team.membersSortedByNumber()) {
-            members.add(new TeamSyncPayload.Member(entry.playerId(), entry.number(), entry.name(), false));
+        for (Team.Entry entry : team.membersInJoinOrder()) {
+            // 大厅快照不携带队内编号；0 只表示“当前不是 MatchTeam 座号”。
+            members.add(new TeamSyncPayload.Member(entry.playerId(), 0, entry.name(),
+                    false, TeamSyncPayload.STATUS_ALIVE));
         }
         return new TeamSyncPayload(team.getTeamId(), team.getTeamNumber(), team.getLeaderId(),
                 false, false, members);
@@ -93,10 +97,18 @@ public final class TeamSync {
         List<TeamSyncPayload.Member> members = new ArrayList<>(team.size());
         for (MatchTeam.Member member : team.membersSorted()) {
             members.add(new TeamSyncPayload.Member(member.playerId(), member.squadIndex(),
-                    member.name(), member.splitOrigin()));
+                    member.name(), member.splitOrigin(), statusOf(member.playerId())));
         }
         return new TeamSyncPayload(team.getMatchTeamId(), team.getTeamNumber(), team.getLeaderId(),
                 true, team.isSplitFromPremade(), members);
+    }
+
+    /**
+     * [BR-TEAMHUD] 成员的实时存活状态：统一走 MatchTeamManager（倒地取自 DownedManager，
+     * 淘汰取自本局淘汰名册——DownedManager 的瞬时标记会在淘汰收尾被清掉，名册才是权威）。
+     */
+    private static int statusOf(UUID playerId) {
+        return MatchTeamManager.INSTANCE.matchStatusOf(playerId);
     }
 
     /** [BR-MATCHTEAM] 把一支 MatchTeam 的快照发给全部在线队员（开局分配 / 重建时调用）。 */
@@ -138,6 +150,7 @@ public final class TeamSync {
             buf.writeVarInt(member.number());
             buf.writeUtf(member.name(), MAX_NAME_LENGTH);
             buf.writeBoolean(member.split()); // [BR-MATCHTEAM 第四步] 该队员来自被拆分的预组队
+            buf.writeVarInt(member.status()); // [BR-TEAMHUD] 存活状态：0 正常 / 1 倒地 / 2 淘汰
         }
         return buf;
     }
@@ -163,7 +176,11 @@ public final class TeamSync {
                 int number = buf.readVarInt();
                 String name = buf.readUtf(MAX_NAME_LENGTH);
                 boolean memberSplit = buf.readBoolean(); // [BR-MATCHTEAM] 与 encode 严格同序
-                members.add(new TeamSyncPayload.Member(playerId, number, name, memberSplit));
+                int status = buf.readVarInt();            // [BR-TEAMHUD] 与 encode 严格同序
+                if (status < TeamSyncPayload.STATUS_ALIVE || status > TeamSyncPayload.STATUS_ELIMINATED) {
+                    status = TeamSyncPayload.STATUS_ALIVE; // 坏数据按正常显示，不炸 HUD
+                }
+                members.add(new TeamSyncPayload.Member(playerId, number, name, memberSplit, status));
             }
             return new TeamSyncPayload(teamId, teamNumber, leaderId, match, split, members);
         } catch (RuntimeException e) {

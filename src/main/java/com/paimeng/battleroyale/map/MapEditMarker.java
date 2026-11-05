@@ -5,6 +5,7 @@ import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.BlockPos;
+import java.util.List;
 
 /** 手持工具时在选区、物资点和出生岛位置刷 END_ROD 光柱。 */
 public final class MapEditMarker {
@@ -18,7 +19,9 @@ public final class MapEditMarker {
                 || player.getOffhandItem().is(ModItems.SELECTION_TOOL);
         boolean holdingLoot = player.getMainHandItem().is(ModItems.LOOT_TOOL)
                 || player.getOffhandItem().is(ModItems.LOOT_TOOL);
-        if (!holdingSelection && !holdingLoot) {
+        boolean holdingChest = player.getMainHandItem().is(ModItems.CHEST_SPAWN_TOOL)
+                || player.getOffhandItem().is(ModItems.CHEST_SPAWN_TOOL);
+        if (!holdingSelection && !holdingLoot && !holdingChest) {
             return;
         }
         if (holdingSelection) {
@@ -30,13 +33,14 @@ public final class MapEditMarker {
                 beam(world, player, selection.x2, selection.z2);
             }
         }
-        if (holdingLoot) {
-            GameMap draft = MapEditSession.draftOf(player.getUUID());
-            if (draft.lootPoints != null) {
-                for (LootPoint point : draft.lootPoints) {
-                    beam(world, player, (int) Math.floor(point.x()), (int) Math.floor(point.z()));
-                }
+        GameMap draft = MapEditSession.draftOf(player.getUUID());
+        if (holdingLoot && draft != null && draft.lootPoints != null) {
+            for (LootPoint point : draft.lootPoints) {
+                beam(world, player, (int) Math.floor(point.x()), (int) Math.floor(point.z()));
             }
+        }
+        if (holdingChest && draft != null) {
+            markManualSpawns(world, player, draft.manualLootSpawns);
         }
     }
 
@@ -72,6 +76,28 @@ public final class MapEditMarker {
             for (LootPoint point : map.lootPoints) {
                 beam(world, player, (int) Math.floor(point.x()), (int) Math.floor(point.z()));
             }
+        }
+        boolean holdingChest = player.getMainHandItem().is(ModItems.CHEST_SPAWN_TOOL)
+                || player.getOffhandItem().is(ModItems.CHEST_SPAWN_TOOL);
+        if (holdingChest) {
+            markManualSpawns(world, player, map.manualLootSpawns);
+        }
+    }
+
+    /** 工具标记的是具体箱子坐标，在准确方块位置生成一小团光粒，便于左键点选删除。 */
+    private static void markManualSpawns(ServerLevel world, ServerPlayer player,
+                                         List<ManualLootSpawn> spawns) {
+        if (spawns == null) {
+            return;
+        }
+        for (ManualLootSpawn spawn : spawns) {
+            if (spawn == null) {
+                continue;
+            }
+            BlockPos pos = spawn.blockPos();
+            world.sendParticles(player, ParticleTypes.END_ROD, true,
+                    pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D,
+                    4, 0.2D, 0.2D, 0.2D, 0.0D);
         }
     }
 

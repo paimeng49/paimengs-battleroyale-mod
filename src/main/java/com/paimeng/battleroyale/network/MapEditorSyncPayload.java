@@ -12,6 +12,74 @@ import java.util.List;
 
 /** 地图编辑器打开、导入列表与保存使用的网络数据。 */
 public record MapEditorSyncPayload(GameMap map) {
+    /** 字符串网络长度上限（<b>UTF-8 字节</b>，物资池两行共用）；超长在写入前截断，不让 writeUtf 抛异常打断保存包。 */
+    public static final int MAX_LOOT_CONFIG_CHARS = 16384;
+
+    /**
+     * 写入前把文本夹到 {@code maxBytes} 个 <b>UTF-8 字节</b>以内（按码点累加，绝不切断半个字符）。
+     *
+     * <p>{@code FriendlyByteBuf#writeUtf(String, int)} / {@code readUtf(int)} 的 maxLength
+     * 越界都是<b>抛异常</b>而不是截断：一个字段超长会让整个保存包发不出去或让对端解码失败
+     * （GUI 上表现为「点了保存毫无反应」）。物资池里出现中文 NBT（如自定义名称）时
+     * 一个字占 3 字节，只按字符数夹是不够的，所以这里按字节算。
+     */
+    public static String clipForWire(String raw, int maxBytes) {
+        if (raw == null) {
+            return "";
+        }
+        if (raw.isEmpty() || utf8Length(raw) <= maxBytes) {
+            return raw;
+        }
+        StringBuilder kept = new StringBuilder(raw.length());
+        int used = 0;
+        int i = 0;
+        while (i < raw.length()) {
+            int cp = raw.codePointAt(i);
+            int size = utf8Size(cp);
+            if (used + size > maxBytes) {
+                break;
+            }
+            kept.appendCodePoint(cp);
+            used += size;
+            i += Character.charCount(cp);
+        }
+        return kept.toString();
+    }
+
+    /** UTF-8 字节长度（不分配字节数组）。 */
+    private static int utf8Length(String s) {
+        int total = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) {
+                total++;
+            } else if (c < 0x800) {
+                total += 2;
+            } else if (Character.isHighSurrogate(c) && i + 1 < s.length()
+                    && Character.isLowSurrogate(s.charAt(i + 1))) {
+                total += 4;
+                i++;
+            } else {
+                total += 3;
+            }
+        }
+        return total;
+    }
+
+    /** 单个码点的 UTF-8 字节数。 */
+    private static int utf8Size(int codePoint) {
+        if (codePoint < 0x80) {
+            return 1;
+        }
+        if (codePoint < 0x800) {
+            return 2;
+        }
+        if (codePoint < 0x10000) {
+            return 3;
+        }
+        return 4;
+    }
+
     /**
      * 保存方向的额外标记：
      * detailUpdate=true 表示来自「地图详情面板」的配置保存，服务端不要拿会话选区覆盖地图里已存的选区；
@@ -26,24 +94,28 @@ public record MapEditorSyncPayload(GameMap map) {
     }
 
     public static void write(FriendlyByteBuf buf, GameMap map, boolean detailUpdate, boolean lootListComplete) {
-        buf.writeUtf(map.mapId == null ? "default" : map.mapId, 64);
-        buf.writeUtf(map.displayName == null ? "地图" : map.displayName, 128);
+        // 全部字符串先夹长度再写：writeUtf 的 maxLength 是「抛异常」而不是「截断」，
+        // 任何一个字段超限都会让整个保存包发不出去（GUI 上表现为点了保存毫无反应）。
+        buf.writeUtf(clipForWire(map.mapId == null ? "default" : map.mapId, 64), 64);
+        buf.writeUtf(clipForWire(map.displayName == null ? "地图" : map.displayName, 128), 128);
         buf.writeInt(map.minX);
         buf.writeInt(map.minZ);
         buf.writeInt(map.maxX);
         buf.writeInt(map.maxZ);
         buf.writeDouble(map.zoneCenterX);
         buf.writeDouble(map.zoneCenterZ);
-        buf.writeInt(map.maxPlayers);
+        // [r149 DYNCAP 模块一] maxPlayers 写死字段已删除：人数上限是 maxTeams × maxTeamSize
+        // 的派生值（GameMap.getMaxPlayers()），下面已有的两个 int 就带齐了全部容量信息。
         buf.writeInt(map.maxRooms);
         buf.writeInt(map.teamLimit);
-        buf.writeUtf(map.sourceArchivePath == null ? "" : map.sourceArchivePath, 512);
-        buf.writeUtf(map.coverImagePath == null ? "" : map.coverImagePath, 256);
+        buf.writeUtf(clipForWire(map.sourceArchivePath, 512), 512);
+        buf.writeUtf(clipForWire(map.coverImagePath, 256), 256);
         var points = map.lootPoints == null ? List.<LootPoint>of() : map.lootPoints;
         buf.writeVarInt(Math.min(points.size(), 10000));
         for (LootPoint p : points) {
-            buf.writeUtf(p.name(), 128);
+            buf.writeUtf(clipForWire(p.name(), 128), 128);
             buf.writeDouble(p.x());
+            buf.writeInt(p.y());
             buf.writeDouble(p.z());
             buf.writeVarInt(p.fontSize());
         }
@@ -63,6 +135,17 @@ public record MapEditorSyncPayload(GameMap map) {
         buf.writeBoolean(map.zoneCenterSet);
         writeZonePhases(buf, map.zonePhases);
         buf.writeDouble(map.flightSpeed); // [BR-FLIGHT-SPEED] 飞机速度随地图配置走（格/tick）
+        buf.writeDouble(map.zoneTtkSeconds); // [r148-TTK] 地图级圈外淘汰秒数（double，支持小数）
+        // [BR-LOOT 模块一] 物资池配置随地图数据走（超长先截断，防 writeUtf 抛异常吞掉整个保存包）。
+        buf.writeUtf(clipForWire(map.lootPool, MAX_LOOT_CONFIG_CHARS), MAX_LOOT_CONFIG_CHARS);
+        buf.writeUtf(clipForWire(map.airdropLootPool, MAX_LOOT_CONFIG_CHARS), MAX_LOOT_CONFIG_CHARS);
+        buf.writeVarInt(map.maxLootBoxes);
+        buf.writeVarInt(map.maxAirdrops);
+        var stages = map.airdropStages == null ? List.<Integer>of() : map.airdropStages;
+        buf.writeVarInt(Math.min(stages.size(), 32));
+        for (Integer stage : stages.subList(0, Math.min(stages.size(), 32))) {
+            buf.writeVarInt(stage == null ? 0 : stage);
+        }
         buf.writeBoolean(detailUpdate);
         buf.writeBoolean(lootListComplete);
     }
@@ -83,7 +166,7 @@ public record MapEditorSyncPayload(GameMap map) {
             buf.writeVarInt(Math.max(0, phase.waitTime));
             buf.writeVarInt(Math.max(0, phase.shrinkTime));
             buf.writeDouble(phase.radius);
-            buf.writeDouble(phase.damage);
+            buf.writeDouble(phase.zoneTtkSeconds);
         }
     }
 
@@ -95,8 +178,8 @@ public record MapEditorSyncPayload(GameMap map) {
             int waitTime = buf.readVarInt();
             int shrinkTime = buf.readVarInt();
             double radius = buf.readDouble();
-            double damage = buf.readDouble();
-            phases.add(new ZonePhaseConfig(waitTime, shrinkTime, radius, damage));
+            double ttk = buf.readDouble();   // [r148] 阶段圈外淘汰秒数（浮点，0 = 跟随地图全局值）
+            phases.add(new ZonePhaseConfig(waitTime, shrinkTime, radius, ttk));
         }
         return phases;
     }
@@ -125,7 +208,7 @@ public record MapEditorSyncPayload(GameMap map) {
         map.maxZ = buf.readInt();
         map.zoneCenterX = buf.readDouble();
         map.zoneCenterZ = buf.readDouble();
-        map.maxPlayers = buf.readInt();
+        // [r149 DYNCAP 模块一] 与 write 严格同序：maxPlayers 不再上网络。
         map.maxRooms = buf.readInt();
         map.teamLimit = buf.readInt();
         map.sourceArchivePath = buf.readUtf(512);
@@ -135,9 +218,10 @@ public record MapEditorSyncPayload(GameMap map) {
         for (int i = 0; i < points; i++) {
             String name = buf.readUtf(128);
             double x = buf.readDouble();
+            int y = buf.readInt();
             double z = buf.readDouble();
             int font = buf.readVarInt();
-            map.lootPoints.add(new LootPoint(x, z, name, font));
+            map.lootPoints.add(new LootPoint(x, y, z, name, font));
         }
         map.spawnX = buf.readDouble();
         map.spawnY = buf.readDouble();
@@ -156,6 +240,19 @@ public record MapEditorSyncPayload(GameMap map) {
         map.zonePhases = readZonePhases(buf);
         map.flightSpeed = buf.readDouble(); // [BR-FLIGHT-SPEED] 与 write 严格同序
         map.normalizeFlightSpeed();         // 伪造 / 坏包在这里就治理成合法值，服务端后续只见好值
+        map.zoneTtkSeconds = buf.readDouble(); // [r148-TTK] 与 write 严格同序
+        map.normalizeZoneTtk();                  // 坏值（NaN / 负 / 离谱大）当场治理回 1 ~ 3600 秒
+        // [BR-LOOT 模块一] 与 write 严格同序：两个物资池 + 上限 + 触发阶段列表。
+        map.lootPool = buf.readUtf(16384);
+        map.airdropLootPool = buf.readUtf(16384);
+        map.maxLootBoxes = buf.readVarInt();
+        map.maxAirdrops = buf.readVarInt();
+        int stageCount = Math.max(0, Math.min(buf.readVarInt(), 32));
+        map.airdropStages = new ArrayList<>(stageCount);
+        for (int i = 0; i < stageCount; i++) {
+            map.airdropStages.add(buf.readVarInt());
+        }
+        map.normalizeLootConfiguration();
         boolean detailUpdate = buf.readBoolean();
         boolean lootComplete = buf.readBoolean();
         return new Decoded(map, detailUpdate, lootComplete);

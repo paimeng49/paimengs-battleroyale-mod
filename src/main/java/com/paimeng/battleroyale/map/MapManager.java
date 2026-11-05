@@ -64,6 +64,8 @@ public final class MapManager {
                 map.normalizeFlightSpeed();
                 // [BR-MATCHTEAM] 同理：旧 JSON 没有 maxTeams / maxTeamSize，初始值 25 / 4；坏值夹回。
                 map.normalizeMatchLimits();
+                // [BR-LOOT] 旧 JSON 没有物资池配置：初始值（空串 / 默认上限）照常过治理闸。
+                map.normalizeLootConfiguration();
                 maps.put(map.mapId, map);
             }
         } catch (Exception e) {
@@ -85,6 +87,7 @@ public final class MapManager {
             Files.createDirectories(directory());
             map.normalizeFlightSpeed(); // [BR-FLIGHT-SPEED] 落盘前最后一道闸：JSON 里永远是合法速度
             map.normalizeMatchLimits();  // [BR-MATCHTEAM] 队伍上限同样过闸
+            map.normalizeLootConfiguration(); // [BR-LOOT] 物资池 / 空投配置落盘前过闸
             ensureCover(map);
             Files.writeString(directory().resolve(map.mapId + ".json"), GSON.toJson(map), StandardCharsets.UTF_8);
             maps.put(map.mapId, map);

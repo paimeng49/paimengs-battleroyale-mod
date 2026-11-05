@@ -10,8 +10,11 @@ import com.paimeng.battleroyale.config.GameModeStore;
 import com.paimeng.battleroyale.game.DownedManager;
 import com.paimeng.battleroyale.game.GameManager;
 import com.paimeng.battleroyale.game.GamePhase;
+import com.paimeng.battleroyale.game.LootSpawner;
 import com.paimeng.battleroyale.game.WarmupManager;
 import com.paimeng.battleroyale.item.SelectionToolItem;
+import com.paimeng.battleroyale.item.ModItems;
+import net.minecraft.world.item.ItemStack;
 import com.paimeng.battleroyale.map.EditWorldManager;
 import com.paimeng.battleroyale.map.GameMap;
 import com.paimeng.battleroyale.map.GameWorldManager;
@@ -24,6 +27,8 @@ import com.paimeng.battleroyale.match.MapQueue;
 import com.paimeng.battleroyale.network.LootPointsSync;
 import com.paimeng.battleroyale.network.MapEditorSync;
 import com.paimeng.battleroyale.network.MapListSync;
+import com.paimeng.battleroyale.network.TeamSync;
+import com.paimeng.battleroyale.team.MatchTeamManager;
 import com.paimeng.battleroyale.team.Team;
 import com.paimeng.battleroyale.team.TeamManager;
 import com.paimeng.battleroyale.util.BrText;
@@ -32,12 +37,16 @@ import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.ChatFormatting;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -45,8 +54,8 @@ import java.util.UUID;
  *（开局不再由玩家侧 br start 触发：br join 进入等待后自动倒计时，
  * 管理员可用 /paimengmods manager start 强制开始。）
  *
- * <p>本类负责 {@code /paimengmods} 根指令下的 <b>br</b>（大逃杀 + 队伍）和
- * <b>qc</b>（快捷消息）两支，并在服务端一次性挂到同一个根节点，避免客户端命令树合并冲突。
+ * <p>本类负责 {@code /paimengmods} 根指令下的 <b>br</b>（大逃杀 + 队伍）指令，
+ * 并在服务端一次性挂载，避免客户端命令树合并冲突。
  *
  * <p>本类只负责“校验 + 给指令执行者回话”，真正的状态变更全部委托给
  * {@link GameManager} / {@link ZoneManager} / {@link TeamManager}——
@@ -78,6 +87,18 @@ public final class BrCommand {
                         .then(Commands.literal("stop")
                                 .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
                                 .executes(ctx -> stop(ctx.getSource())))
+                        .then(Commands.literal("loot_tool")
+                                 .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
+                                 .executes(ctx -> lootTool(ctx.getSource())))
+                        .then(Commands.literal("chest_tool")
+                                 .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
+                                 .executes(ctx -> chestTool(ctx.getSource())))
+                         .then(Commands.literal("debug")
+                                .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
+                                .then(Commands.literal("loot")
+                                        .executes(ctx -> debugLoot(ctx.getSource())))
+                                 .then(Commands.literal("tploot")
+                                         .executes(ctx -> debugTeleportLoot(ctx.getSource()))))
                         .then(Commands.literal("setcenter")
                                 .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
                                 .executes(ctx -> setCenter(ctx.getSource())))
@@ -197,7 +218,7 @@ public final class BrCommand {
                                                                         StringArgumentType.getString(ctx, "mapId"),
                                                                         IntegerArgumentType.getInteger(ctx, "batchSize"),
                                                                         IntegerArgumentType.getInteger(ctx, "memoryLimit")))))))))
-                .then(QuickChatCommand.branch()));
+                );
     }
 
     // ------------------------------------------------------------------
@@ -209,6 +230,11 @@ public final class BrCommand {
     private static int join(CommandSourceStack source) {
         ServerPlayer player = asPlayer(source);
         if (player == null) {
+            return FAILURE;
+        }
+        // [r144][BR-LOBBYTEAM] 绝对权限拦截：属于大厅队的非队长成员，连地图列表都不给开。
+        // 选图/进图权 100% 归属队长；晚进服的队员由队长重新点一次地图带进来。
+        if (isLobbyMemberWithoutLeaderRight(source, player)) {
             return FAILURE;
         }
         if (!GameManager.INSTANCE.getPhase().allowsRosterChange()) {
@@ -232,11 +258,13 @@ public final class BrCommand {
         return SUCCESS;
     }
 
-    /** 一行可点击的地图选项：&gt;&gt; 显示名（等待人数/上限 人），点击执行 join &lt;mapId&gt;。 */
+    /** 一行可点击的地图选项：&gt;&gt; 显示名（当前等待人数/动态上限 人），点击执行 join &lt;mapId&gt;。 */
     private static MutableComponent mapOptionLine(GameMap map) {
         String displayName = map.displayName == null || map.displayName.isBlank() ? map.mapId : map.displayName;
-        int waiting = Math.min(MapQueue.INSTANCE.waitingCount(map.mapId), Math.max(1, map.maxPlayers));
-        MutableComponent line = BrText.mutable(">> " + displayName + "（" + waiting + "/" + map.maxPlayers + " 人）")
+        // [r149 DYNCAP 模块一] 上限 = maxTeams × maxTeamSize（动态派生，不再是写死的 100）。
+        int max = map.getMaxPlayers();
+        int waiting = Math.min(MapQueue.INSTANCE.waitingCount(map.mapId), max);
+        MutableComponent line = BrText.mutable(">> " + displayName + "（" + waiting + "/" + max + " 人）")
                 .withStyle(ChatFormatting.GREEN);
         line.setStyle(line.getStyle()
                 .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, "/paimengmods br join " + map.mapId))
@@ -246,45 +274,145 @@ public final class BrCommand {
         return line;
     }
 
-    /** /paimengmods br join &lt;mapId&gt;：加入该地图的等待队列（WAITING 阶段）。 */
+    /**
+     * [r144][BR-LOBBYTEAM] 大厅队加入地图的绝对权限判定（join 列地图 与 join &lt;mapId&gt; 选图 共用）：
+     * 玩家属于某个大厅队伍（DraftGroup）且不是队长 → 红字提示并返回 true（拦截）；
+     * 散人（无大厅队伍）返回 false，行为完全不受影响。
+     */
+    private static boolean isLobbyMemberWithoutLeaderRight(CommandSourceStack source, ServerPlayer player) {
+        Team team = TeamManager.INSTANCE.teamOf(player.getUUID());
+        if (team != null && !team.isLeader(player.getUUID())) {
+            source.sendFailure(BrText.of("只有队长才能选择地图加入，请等待队长选择地图！"));
+            return true;
+        }
+        return false;
+    }
+
+    /** [r143][BR-LOBBYTEAM] 加入地图指令（br join <mapId> 分支）：队长权限 + 全队批量进入。 */
     private static int joinMap(CommandSourceStack source, String mapId) {
         ServerPlayer player = asPlayer(source);
         if (player == null) {
             return FAILURE;
         }
+        // [r144][BR-LOBBYTEAM] 绝对权限拦截（方法最开头，先于一切状态判断）：
+        // 大厅队里非队长成员敲 join / 点地图选项，一律红字拦截——
+        // 上一版「队长已在该图等待时允许成员跟随进入」的后门已彻底移除。
+        // 晚进服的队员：队长重新点击一次地图，走下面的全队遍历即可把新人带进来。
+        if (isLobbyMemberWithoutLeaderRight(source, player)) {
+            return FAILURE;
+        }
         GameManager game = GameManager.INSTANCE;
+        if (game.getPhase() == GamePhase.RESETTING) {
+            source.sendFailure(BrText.of("服务器正在重置地图，请稍后。"));
+            return FAILURE;
+        }
         if (!game.getPhase().allowsRosterChange()) {
             source.sendFailure(BrText.of("对局已经开始或正在结算，不能加入。"));
             return FAILURE;
         }
-        // [BR-MATCHTEAM 模块一] 大厅自由组队：不再拦"已在队伍中"的玩家排队。
         GameMap map = MapManager.INSTANCE.getMap(mapId);
         if (map == null) {
             source.sendFailure(BrText.of("地图不存在"));
             return FAILURE;
         }
-        String queueError = MapQueue.INSTANCE.join(player.getUUID(), mapId);
-        if (queueError != null) {
-            source.sendFailure(BrText.of(queueError));
+        String displayName = map.displayName == null || map.displayName.isBlank() ? map.mapId : map.displayName;
+        Team team = TeamManager.INSTANCE.teamOf(player.getUUID());
+        if (team == null) {
+            // —— 无大厅队的散人：单人进入（原有行为不变）——
+            String error = enterWaiting(player, map);
+            if (error != null) {
+                source.sendFailure(BrText.of(error));
+                return FAILURE;
+            }
+            source.sendSuccess(() -> BrText.of("已加入 " + displayName + "，正在传送到出生岛；等待期间处于无敌状态，可自由行动"), false);
+            return SUCCESS;
+        }
+        // —— 走到这里必然是队长：带全队进图，按加入顺序遍历全部在线成员批量进场 ——
+        // （成员后上线/漏带的场景：队长再点一次同一地图，enterWaiting 对已在等待区的
+        // 成员幂等跳过传送，只对齐状态，晚进服的人会被这轮遍历拉进来。）
+        // [r149 DYNCAP 模块一] 整队容量预检：当前等待人数 + 即将新增占位人数 > 动态上限
+        // （maxTeams × maxTeamSize）时整队拒绝进入并提示换图——已在该图等位的成员不重复计数，
+        // 队长重跑带队不会被自己家的老名额挡路。
+        int incoming = 0;
+        for (Team.Entry entry : team.membersInJoinOrder()) {
+            ServerPlayer member = source.getServer().getPlayerList().getPlayer(entry.playerId());
+            if (member != null && !map.mapId.equals(MapQueue.INSTANCE.waitingMapOf(member.getUUID()))) {
+                incoming++;
+            }
+        }
+        String capacityError = MapQueue.INSTANCE.capacityError(map, incoming);
+        if (capacityError != null) {
+            source.sendFailure(BrText.of(capacityError));
             return FAILURE;
         }
-        // 同步进旧的全局名单：人数校验、匹配与统计逻辑不用改。
-        game.join(player.getGameProfile().getName());
-        // 加入后立刻传送到该地图游戏维度的出生岛中心（维度未生成时后台排队，就绪自动传送）。
+        String leaderName = player.getGameProfile().getName();
+        int entered = 0;
+        List<String> offline = new ArrayList<>();
+        List<String> failed = new ArrayList<>();
+        for (Team.Entry entry : team.membersInJoinOrder()) {
+            ServerPlayer member = source.getServer().getPlayerList().getPlayer(entry.playerId());
+            if (member == null) {
+                offline.add(entry.name()); // 离线成员跳过：上线后大厅队还在，跟队长再进即可
+                continue;
+            }
+            String error = enterWaiting(member, map);
+            if (error != null) {
+                failed.add(entry.name() + "（" + error + "）");
+                member.displayClientMessage(BrText.of("随队长 " + leaderName + " 进图失败：" + error), false);
+                continue;
+            }
+            entered++;
+            if (!member.getUUID().equals(player.getUUID())) {
+                member.displayClientMessage(BrText.of("队长 " + leaderName + " 已选择 " + displayName
+                        + "，全队已带入出生岛等待；等待期间处于无敌状态，可自由行动"), false);
+            }
+        }
+        // 状态同步：全员进图后立刻向全队补发大厅队伍同步包（TeamSync 大厅快照），
+        // 左上角 HUD 立即显示队长与全部成员——哪怕他们刚从别的维度被拽过来。
+        TeamSync.syncTeam(team, source.getServer());
+        final int enteredFinal = entered;
+        source.sendSuccess(() -> BrText.of("[大逃杀] 队长带队进入 " + displayName + " 出生岛等待："
+                + enteredFinal + " 人已就位（含你）"
+                + (offline.isEmpty() ? "" : "；离线未带入：" + String.join("、", offline))
+                + (failed.isEmpty() ? "" : "；失败：" + String.join("、", failed))), false);
+        return SUCCESS;
+    }
+
+    /**
+     * [r143] 单人「进入该地图等待区」的完整流程（散人 / 队长带队两种路径共用同一套逻辑，
+     * 绝不分叉；[r144] 成员跟随后门已移除）：
+     * 写地图等待队列 → 进全局对局名单 → 传送出生岛（维度未生成时后台排队，
+     * 就绪自动传送）→ 登记无敌与等待状态 → 一次性推送该图物资点列表。
+     *
+     * <p>已在该图等待（重复执行 / 队长带队重跑）视为幂等：不重复占队列，
+     * 后续步骤照常重新对齐。传送失败则整体回滚（退队列 + 退名单），
+     * 返回错误文案；成功返回 null。
+     */
+    private static String enterWaiting(ServerPlayer player, GameMap map) {
+        UUID playerId = player.getUUID();
+        String name = player.getGameProfile().getName();
+        GameManager game = GameManager.INSTANCE;
+        String queueError = MapQueue.INSTANCE.join(playerId, map.mapId);
+        if (queueError != null && !"你已在该地图等待中".equals(queueError)) {
+            return queueError;
+        }
+        // [r144] 幂等：已在该图等待区站稳（队列 + 热身无敌登记都在）的玩家
+        // （队长带队重跑/晚进服补带的场景）不重复传送，只补发一次物资点同步对齐状态。
+        if (queueError != null && WarmupManager.INSTANCE.isWaiting(playerId)) {
+            LootPointsSync.sendTo(player, map);
+            return null;
+        }
+        game.join(name);
         String teleportError = GameWorldManager.enterAsWaitingPlayer(player, map.mapId);
         if (teleportError != null) {
-            MapQueue.INSTANCE.leave(player.getUUID());
-            game.leave(player.getGameProfile().getName());
-            source.sendFailure(BrText.of("传送到出生岛失败：" + teleportError));
-            return FAILURE;
+            MapQueue.INSTANCE.leave(playerId);
+            game.leave(name);
+            return "传送到出生岛失败：" + teleportError;
         }
         // 等待状态：可自由行动但无敌（伤害在 mixin.LivingEntityMixin 里按无敌标记拒绝）。
         WarmupManager.INSTANCE.join(player);
-        // 进入地图等待：把物资点列表一次性推给客户端（HUD / 全屏地图按维度过滤显示）。
         LootPointsSync.sendTo(player, map);
-        String displayName = map.displayName == null || map.displayName.isBlank() ? map.mapId : map.displayName;
-        source.sendSuccess(() -> BrText.of("已加入 " + displayName + "，正在传送到出生岛；等待期间处于无敌状态，可自由行动"), false);
-        return SUCCESS;
+        return null;
     }
 
     /**
@@ -295,10 +423,20 @@ public final class BrCommand {
      * 回主世界大厅，并向本人提示「你已退出比赛等待。」。等待期的 300 秒倒计时如果因这次退出
      * 人数不足 minPlayersToStart，由 WarmupManager.leave(player) 当场取消并复位（强制倒计时除外）。
      *
-     * <p>赛中进行（PREPARING / FLIGHT 航线 / RUNNING 毒圈与跳伞）：按逃跑处理——
-     * 走与被击杀同一套服务端淘汰结算（DownedManager.eliminateForDesert：存活人数 -1、
-     * 队伍坍缩检查、淘汰事件、HUD 清除包），并向全服广播「XXX 逃跑了/退出了比赛，
-     * 已被判定阵亡！」，最后同样传送回主世界。
+     * <p>[r-LEAVE] 赛中进行（PREPARING / FLIGHT 航线 / RUNNING 毒圈与跳伞）按存活状态分两条路：
+     * <ol>
+     *   <li><b>存活（ALIVE）/ 倒地（DOWNED）主动退出 = 判定阵亡</b>：绝对不能直接传送——
+     *       先把与被击杀完全同一套淘汰结算走完
+     *       （{@link DownedManager#eliminateForDesert}：原地骨灰盒、击倒/淘汰播报、
+     *       全队覆灭播报与排名结算、Buff 全清、收降落伞、存活与击杀结算；
+     *       击杀者取最近玩家伤害来源，否则记「环境/主动退出」），
+     *       结算全部完成后才传送回大厅并恢复原游戏模式，
+     *       提示「你已主动退出对局，判定为阵亡。」；</li>
+     *   <li><b>已淘汰（ELIMINATED）旁观中途退出</b>：直接传送回大厅、恢复原模式，
+     *       提示「你已退出本局观战，正在返回大厅。」——绝不重复死亡结算与骨灰盒。</li>
+     * </ol>
+     * 两条路最后都做同一套数据清理：对局名单、等待队列、击倒/HUD 残留、待传送排队；
+     * 队友坐标包同步会跳过不在游戏维度的成员（见 TeammatePosSync），杜绝小地图幽灵队友。
      */
     private static int leave(CommandSourceStack source) {
         ServerPlayer player = asPlayer(source);
@@ -318,18 +456,26 @@ public final class BrCommand {
             source.sendFailure(BrText.of("你不在当前大逃杀的名单里。"));
             return FAILURE;
         }
-        if (inMatch) {
-            // —— 赛中退出 = 逃跑，判定阵亡 ——
-            // 只有对局名单里的人才做击杀结算（旁观/管理员误触时只做起立退出）。
-            if (joined) {
-                DownedManager.INSTANCE.eliminateForDesert(player);
-                GameManager.INSTANCE.leave(name);
-                BrText.broadcast(source.getServer(), name + " 逃跑了/退出了比赛，已被判定阵亡！");
+        // [r-LEAVE] 旁观判定权威 = 本局淘汰名册（DownedManager 的瞬时标记在淘汰收尾
+        // 会被清掉，旁观者此刻已不持有它；名册随本局走，disband 才清空）。
+        boolean alreadyEliminated = MatchTeamManager.INSTANCE.wasEliminatedThisMatch(playerId);
+        String resultText;
+        if (inMatch && joined) {
+            if (alreadyEliminated) {
+                // —— 二、观战中途退出：只传送，不再碰任何死亡结算 / 骨灰盒 ——
+                resultText = "你已退出本局观战，正在返回大厅。";
+            } else {
+                // —— 一、存活 / 倒地主动退出：先走完一整套"阵亡"结算，再传送 ——
+                DownedManager.INSTANCE.eliminateForDesert(player, true);
+                resultText = "你已主动退出对局，判定为阵亡。";
             }
+            // 退出对局名单（存活人数与重连判定的权威依据）；大厅队伍编制保留。
+            GameManager.INSTANCE.leave(name);
         } else {
             // —— 赛前等待：正常退出 ——
             // [BR-MATCHTEAM] 只退出排队与名单，大厅队伍原样保留（换图再排队不用重新组队）。
             GameManager.INSTANCE.leave(name);
+            resultText = "你已退出比赛等待。";
         }
         MapQueue.INSTANCE.leave(playerId);
         // 无敌标记与热身名单一起清除；顺带把击倒/淘汰残留也立清，避免带着 HUD 回大厅。
@@ -343,8 +489,78 @@ public final class BrCommand {
         if (teleportError != null && !teleportError.contains("不在游戏维度")) {
             source.sendFailure(BrText.of("传送回大厅失败：" + teleportError));
         }
-        source.sendSuccess(() -> BrText.of(inMatch
-                ? "你逃跑了，已被判定阵亡，正在送回大厅。" : "你已退出比赛等待。"), false);
+        final String successText = resultText;
+        source.sendSuccess(() -> BrText.of(successText), false);
+        return SUCCESS;
+    }
+
+    /** /paimengmods br loot_tool：发放旧的区域地标工具（写 lootPoints，用于地图显示/航线）。 */
+    private static int lootTool(CommandSourceStack source) {
+        ServerPlayer player = asPlayer(source);
+        if (player == null) {
+            return FAILURE;
+        }
+        ItemStack stack = new ItemStack(ModItems.LOOT_TOOL);
+        if (!player.getInventory().add(stack)) {
+            player.drop(stack, false);
+        }
+        source.sendSuccess(() -> BrText.of("已获得物资点工具（区域地标）：右键添加，左键移除"), false);
+        return SUCCESS;
+    }
+
+    /** /paimengmods br chest_tool：发放物资箱生成工具（写 manualLootSpawns，开局强制出箱子）。 */
+    private static int chestTool(CommandSourceStack source) {
+        ServerPlayer player = asPlayer(source);
+        if (player == null) {
+            return FAILURE;
+        }
+        ItemStack stack = new ItemStack(ModItems.CHEST_SPAWN_TOOL);
+        if (!player.getInventory().add(stack)) {
+            player.drop(stack, false);
+        }
+        source.sendSuccess(() -> BrText.of("已获得物资箱生成工具：右键记录箱子坐标，左键移除"), false);
+        return SUCCESS;
+    }
+
+    /** /paimengmods br debug loot：在准星方块上方或脚下强制生成普通物资箱。 */
+    private static int debugLoot(CommandSourceStack source) {
+        ServerPlayer player = asPlayer(source);
+        if (player == null) {
+            return FAILURE;
+        }
+        net.minecraft.world.phys.HitResult result = player.pick(6.0D, 1.0F, false);
+        net.minecraft.core.BlockPos pos = result instanceof net.minecraft.world.phys.BlockHitResult
+                ? ((net.minecraft.world.phys.BlockHitResult) result).getBlockPos().above()
+                : player.blockPosition();
+        if (LootSpawner.INSTANCE.forceSpawnDebug(player, pos)) {
+            source.sendSuccess(() -> BrText.of("已在 " + pos.toShortString() + " 强制生成并填充物资箱"), false);
+            return SUCCESS;
+        }
+        source.sendFailure(BrText.of("调试物资箱生成失败：请确认你在游戏维度，目标位置是空气，且地图已加载"));
+        return FAILURE;
+    }
+
+    /** /paimengmods br debug tploot：显示最近 5 个箱子，并传送到最近箱子上方。 */
+    private static int debugTeleportLoot(CommandSourceStack source) {
+        ServerPlayer player = asPlayer(source);
+        if (player == null) {
+            return FAILURE;
+        }
+        List<BlockPos> nearest = LootSpawner.INSTANCE.latestPlacedChests(player.level().dimension(), 5);
+        if (nearest.isEmpty()) {
+            source.sendFailure(BrText.of("当前维度没有已记录的物资箱。"));
+            return FAILURE;
+        }
+        source.sendSuccess(() -> BrText.of("最近的物资箱坐标："), false);
+        for (int i = 0; i < nearest.size(); i++) {
+            BlockPos pos = nearest.get(i);
+            final int index = i + 1;
+            source.sendSuccess(() -> BrText.of("#" + index + " " + pos.toShortString()), false);
+        }
+        BlockPos target = nearest.get(0);
+        player.teleportTo((ServerLevel) player.level(), target.getX() + 0.5D,
+                target.getY() + 2.0D, target.getZ() + 0.5D, player.getYRot(), player.getXRot());
+        source.sendSuccess(() -> BrText.of("已传送到第一个物资箱上方。"), false);
         return SUCCESS;
     }
 
@@ -538,6 +754,16 @@ public final class BrCommand {
             map.lootPoints = new java.util.ArrayList<>(draft.lootPoints);
         } else if (map.lootPoints == null) {
             map.lootPoints = new java.util.ArrayList<>();
+        }
+        if (draft.manualLootSpawns != null && !draft.manualLootSpawns.isEmpty()) {
+            map.manualLootSpawns = new java.util.ArrayList<>();
+            for (com.paimeng.battleroyale.map.ManualLootSpawn spawn : draft.manualLootSpawns) {
+                if (spawn != null) {
+                    map.manualLootSpawns.add(new com.paimeng.battleroyale.map.ManualLootSpawn(spawn.x, spawn.y, spawn.z));
+                }
+            }
+        } else if (map.manualLootSpawns == null) {
+            map.manualLootSpawns = new java.util.ArrayList<>();
         }
         if (selection.archivePath != null && !selection.archivePath.isBlank()) {
             map.sourceArchivePath = selection.archivePath;
@@ -1130,11 +1356,11 @@ public final class BrCommand {
         source.sendSuccess(() -> BrText.mutable("【队伍 " + teamRef.getTeamNumber() + " 号】")
                 .withStyle(ChatFormatting.GOLD)
                 .append(gauge(teamRef.size(), limit)), false);
-        for (Team.Entry entry : team.membersSortedByNumber()) {
+        for (Team.Entry entry : team.membersInJoinOrder()) {
             boolean leader = entry.playerId().equals(team.getLeaderId());
             boolean self = entry.playerId().equals(player.getUUID());
-            String label = entry.number() + "号";
-            source.sendSuccess(() -> teamRow(label, entry.name(), leader, self), false);
+            // 大厅只显示队长标记和成员名字，不显示任何队内编号。
+            source.sendSuccess(() -> teamRow("", entry.name(), leader, self), false);
         }
         return SUCCESS;
     }

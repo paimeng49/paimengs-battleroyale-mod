@@ -17,15 +17,16 @@ import java.util.UUID;
  * 队友编号 HUD：屏幕<b>左上角</b>画一列"编号 名字"，只在客户端存在
  * （挂在 {@code HudRenderCallback} 上，见 {@code BattleRoyaleModClient}）。
  *
- * <p>规则（都来自需求）：
+ * <p>规则（[BR-NOLOBBYNUMBER] 大厅与局内两套口径）：
  * <ul>
  *   <li>数据只读 {@link ClientTeamState}；没有队伍 → 一行都不画；</li>
- *   <li>每行 = 队员编号 + 空格 + 名字，编号用<b>该成员编号固定对应</b>的标志色：
- *       1 黄、2 橙、3 蓝、4 绿；取色用的是成员条目自带的<b>队内编号</b>
- *       （{@code member.number()}），不是队伍编号；</li>
- *   <li>队内编号超过 4（异常情况）回退到白色；</li>
- *   <li>表头一行"队伍 N"；队长在行尾加 ★，自己这行的名字高亮成绿色
- *       ——这两个是锦上添花，不影响"编号 名字"的主体格式。</li>
+ *   <li><b>局内 MatchTeam 快照（match=true）</b>：每行 = 座号 + 空格 + 名字，
+ *       座号用<b>该局内座号固定对应</b>的标志色：1 黄、2 橙、3 蓝、4 绿
+ *       （{@code member.number()} 此时就是 squadIndex）；超过 4 回退白色；</li>
+ *   <li><b>大厅快照（match=false）</b>：只画"我的队伍"表头 + 成员名字，
+ *       队长标注（队长）★，<b>没有任何数字编号和战术色</b>——
+ *       大厅队根本不带编号（服务端发的成员编号恒 0），HUD 也不画它；</li>
+ *   <li>队长行尾加 ★，自己这行的名字高亮成绿色。</li>
  * </ul>
  *
  * <p>绘制用原版静态工具 {@link DrawableHelper#drawTextWithShadow}，
@@ -59,15 +60,20 @@ public final class TeamHudRenderer {
     private static final int HEADER = 0xFFAAAAAA;         // 表头灰色
     /** [BR-MATCHTEAM 第四步] 预组队拆分提示的金色。 */
     private static final int SPLIT_MARK = 0xFFFFD700;
+    /** [BR-TEAMHUD] 倒地成员名字：深红（需求指定），行尾再补一个"倒地"标识。 */
+    private static final int NAME_DOWNED = 0xFFAA0000;
+    /** [BR-TEAMHUD] 已淘汰成员名字：灰色 + 删除线（需求指定）。 */
+    private static final int NAME_ELIMINATED = 0xFF808080;
 
     private TeamHudRenderer() {
     }
 
     /**
-     * 队内编号对应的固定标志色。
+     * <b>局内座号</b>对应的固定标志色（[BR-NOLOBBYNUMBER] 大厅成员编号恒 0，只会拿到白色兜底；
+     * 大厅模式下 HUD 本来也不画编号列）。
      *
-     * @param memberNumber <b>队内编号</b>（取自成员条目 {@code member.number()}，
-     *                     不是队伍编号）；1-4 有专属色，其余（含 0 / 负数等异常）一律白色
+     * @param memberNumber 局内 squadIndex（1-4 有专属色，其余白色）；
+     *                     标点/小地图在大厅场景收到 0 时同样落回白色
      */
     public static int colorOf(int memberNumber) {
         return switch (memberNumber) {
@@ -100,32 +106,53 @@ public final class TeamHudRenderer {
         // 左上角顶部若被状态 HUD（剩余/击杀）占用，队友列表整体下移避让；
         // 没有统计时 occupiedHeight=0，行为与旧版完全一致。
         int y = MARGIN_Y + StatsHudRenderer.occupiedHeight(text);
-        // [BR-MATCHTEAM 模块三] 表头：局内 MatchTeam 显示 "#N队"，大厅队沿用 "队伍 N"。
-        String header = ClientTeamState.isMatch()
-                ? "#" + ClientTeamState.teamNumber() + "队"
-                : "队伍 " + ClientTeamState.teamNumber();
+        // [BR-MATCHTEAM / BR-NOLOBBYNUMBER] 表头与列表分两种口径：
+        //   局内 MatchTeam：#N队 + 座号上色（这是战术编号唯一合法的显示处）；
+        //   大厅队：只显示"我的队伍"，成员行只有队长标识 + 名字，绝不出现 1~4 数字编号。
+        boolean match = ClientTeamState.isMatch();
+        String header = match ? "#" + ClientTeamState.teamNumber() + "队" : "我的队伍";
         GuiDraw.drawTextWithShadow(matrices, text,
-                BrText.mutable(header).withStyle(ClientTeamState.isMatch() ? ChatFormatting.YELLOW : ChatFormatting.GRAY),
-                MARGIN_X, y, ClientTeamState.isMatch() ? colorOf(1) : HEADER);
+                BrText.mutable(header).withStyle(match ? ChatFormatting.YELLOW : ChatFormatting.GRAY),
+                MARGIN_X, y, match ? colorOf(1) : HEADER);
         y += text.lineHeight + LINE_GAP;
 
         for (com.paimeng.battleroyale.network.TeamSyncPayload.Member member : members) {
-            // 1) 编号：按该成员自己的队内编号取固定标志色（不用队伍编号）
-            String numberText = Integer.toString(member.number());
-            GuiDraw.drawTextWithShadow(matrices, text, BrText.of(numberText),
-                    MARGIN_X, y, colorOf(member.number()));
+            // 1) 座号列：只有局内快照才画（座号→固定标志色 1黄2橙3蓝4绿）；
+            //    [BR-NOLOBBYNUMBER] 大厅行没有编号列，名字直接从左边缘画起。
+            int rowX = MARGIN_X;
+            String numberText = "";
+            if (match) {
+                numberText = Integer.toString(member.number());
+                GuiDraw.drawTextWithShadow(matrices, text, BrText.of(numberText),
+                        MARGIN_X, y, colorOf(member.number()));
+                rowX = MARGIN_X + text.width(numberText + " ");
+            }
 
-            // 2) 名字：自己绿色，队友白色；队长行尾加 ★
+            // 2) 名字：自己绿色，队友白色；队长加"（队长）★"标识
             boolean self = member.playerId().equals(selfId);
-            String namePart = " " + member.name()
-                    + (member.playerId().equals(leaderId) ? " ★" : "")
+            String namePart = member.name()
+                    + (member.playerId().equals(leaderId) ? "（队长）★" : "")
                     + (self ? "（我）" : "");
-            GuiDraw.drawTextWithShadow(matrices, text, BrText.of(namePart),
-                    MARGIN_X + text.width(numberText + " "), y, self ? NAME_SELF : NAME_WHITE);
+
+            // [BR-TEAMHUD] 按成员实时状态调整名字颜色与后缀：
+            //   ALIVE（0）= 原样；DOWNED（1）= 深红 + "倒地"；ELIMINATED（2）= 灰色 + 删除线。
+            int status = member.status();
+            String displayName = namePart;
+            int nameColor = self ? NAME_SELF : NAME_WHITE;
+            net.minecraft.network.chat.MutableComponent nameComponent = BrText.mutable(namePart);
+            if (status == com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_DOWNED) {
+                displayName = namePart + " 倒地";
+                nameComponent = BrText.mutable(displayName);
+                nameColor = NAME_DOWNED;
+            } else if (status == com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_ELIMINATED) {
+                nameComponent = nameComponent.withStyle(ChatFormatting.STRIKETHROUGH);
+                nameColor = NAME_ELIMINATED;
+            }
+            GuiDraw.drawTextWithShadow(matrices, text, nameComponent, rowX, y, nameColor);
 
             // [BR-MATCHTEAM 第四步] 经历过预组队拆分的成员行尾加标记
             if (member.split()) {
-                int nameEnd = MARGIN_X + text.width(numberText + " " + namePart);
+                int nameEnd = rowX + text.width(displayName);
                 GuiDraw.drawTextWithShadow(matrices, text, BrText.of(" ✂"),
                         nameEnd, y, SPLIT_MARK);
             }

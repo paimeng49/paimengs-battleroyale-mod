@@ -39,14 +39,15 @@ public final class MatchTeamAllocator {
     // ------------------------------------------------------------------
 
     /**
-     * 预组队里的一名成员：lobbyNumber = 大厅队座次（散人 0），leader = 是否大厅队长，
+     * 预组队里的一名成员：joinOrder = 大厅加入顺序下标（开局分配瞬间现算的排序键，
+     * <b>不是大厅持有的编号</b>；散人 0），leader = 是否大厅队长，
      * fromSplit = [BR-MATCHTEAM 第四步] 该成员是否经历过第一步预拆解（HUD 拆分提示按人显示）。
      */
-    public record Member(UUID playerId, String name, int lobbyNumber, boolean leader, boolean fromSplit) {
+    public record Member(UUID playerId, String name, int joinOrder, boolean leader, boolean fromSplit) {
 
         /** 分配输入用的便捷构造（还没拆，fromSplit=false）。 */
-        public Member(UUID playerId, String name, int lobbyNumber, boolean leader) {
-            this(playerId, name, lobbyNumber, leader, false);
+        public Member(UUID playerId, String name, int joinOrder, boolean leader) {
+            this(playerId, name, joinOrder, leader, false);
         }
     }
 
@@ -115,7 +116,7 @@ public final class MatchTeamAllocator {
                 List<Member> chunk = new ArrayList<>(take);
                 for (Member member : sorted.subList(index, index + take)) {
                     // 打过「来自同一开黑队」标识：本块每名成员都算被拆过。
-                    chunk.add(new Member(member.playerId(), member.name(), member.lobbyNumber(),
+                    chunk.add(new Member(member.playerId(), member.name(), member.joinOrder(),
                             member.leader(), true));
                 }
                 index += take;
@@ -209,11 +210,11 @@ public final class MatchTeamAllocator {
     // 小工具
     // ------------------------------------------------------------------
 
-    /** 队长恒排最前，其余按大厅座次升序（散人 lobbyNumber=0 不影响，本身就单人）。 */
+    /** 队长恒排最前，其余按加入顺序升序（散人 joinOrder=0 不影响，本身就单人）。 */
     private static List<Member> sortedMembers(List<Member> members) {
         List<Member> sorted = new ArrayList<>(members);
         sorted.sort(Comparator.comparingInt((Member m) -> m.leader() ? 0 : 1)
-                .thenComparingInt(m -> m.lobbyNumber() < 0 ? 999 : m.lobbyNumber()));
+                .thenComparingInt(m -> m.joinOrder() < 0 ? 999 : m.joinOrder()));
         return sorted;
     }
 

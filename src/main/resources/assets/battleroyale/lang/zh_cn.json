@@ -8,5 +8,12 @@
   "item.battleroyale.self_reviver": "自救器",
   "item.battleroyale.selection_tool": "选区工具",
   "item.battleroyale.loot_tool": "物资点工具",
-  "item.battleroyale.spawn_tool": "出生岛工具"
+  "item.battleroyale.chest_spawn_tool": "物资箱工具",
+  "item.battleroyale.spawn_tool": "出生岛工具",
+  "item.battleroyale.bandage": "绷带",
+  "item.battleroyale.first_aid_kit": "急救包",
+  "item.battleroyale.medical_kit": "医疗箱",
+  "item.battleroyale.energy_drink": "能量饮料",
+  "item.battleroyale.painkiller": "止痛药",
+  "modmenu.nameTranslation.battleroyale": "派蒙的大逃杀模组"
 }

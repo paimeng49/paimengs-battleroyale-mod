@@ -4,6 +4,8 @@ import com.google.common.collect.ImmutableList;
 import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.game.FlightManager;
 import com.paimeng.battleroyale.game.GameManager;
+import com.paimeng.battleroyale.team.MatchTeam;
+import com.paimeng.battleroyale.team.MatchTeamManager;
 import com.paimeng.battleroyale.item.ModItems;
 import com.paimeng.battleroyale.match.MapQueue;
 import com.paimeng.battleroyale.mixin.MinecraftServerAccessor;
@@ -12,6 +14,7 @@ import com.paimeng.battleroyale.util.BrText;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.GameType;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.resources.ResourceLocation;
@@ -34,6 +37,8 @@ import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.FlatLevelSource;
 import net.minecraft.world.level.levelgen.flat.FlatLevelGeneratorSettings;
 import net.minecraft.world.level.storage.ServerLevelData;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -637,6 +642,11 @@ public final class GameWorldManager {
         double x;
         double y;
         double z;
+        // [BR-INVISO] 开局传送（含 br join 落岛与 PREPARING 统一进场）：
+        // 传送前把原背包深拷贝进隔离仓并清空当前背包（管理员 match=false 不隔离）。
+        if (match) {
+            com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.onEnterMatch(player);
+        }
         if (match) {
             BlockPos target = matchLanding(map, world);
             x = target.getX() + 0.5;
@@ -659,6 +669,15 @@ public final class GameWorldManager {
             player.displayClientMessage(BrText.of("进入游戏维度失败：" + e.getMessage()), false);
             return;
         }
+        // [r-FULLRESET] 开局传送成功落进比赛维度：血量/饥饿/饱和度拉满，
+        // 清空上一局残留的药水效果与火（管理员 match=false 进入不重置）。
+        if (match) {
+            com.paimeng.battleroyale.game.FullStatusReset.apply(player);
+            // [BR-GAMEMODE-BUGFIX] 这里不能再硬编码 setGameMode(SURVIVAL)：
+            // 它会把玩家的原模式（如创造）先覆盖掉，导致随后 GameModeManager
+            // 记录到的是"生存"，出图恢复就成了错误的生存模式。模式收敛统一由
+            // 方法末尾的 GameModeManager.onEnterGameWorld（先记录、再按阶段下发）完成。
+        }
         // 把重生点也设进游戏维度（维度已挂载进 worlds，死亡/传送按 key 查得到）：
         // 否则玩家在维度里死亡会被原版丢回主世界重生。
         try {
@@ -675,6 +694,8 @@ public final class GameWorldManager {
             // 管理员进入游戏维度：发放物资点工具和出生岛工具。
             giveAdminTools(player);
         }
+        // [BR-GAMEMODE] 成功落进游戏维度：记录进入前的模式并按当前阶段设置局内模式。
+        com.paimeng.battleroyale.game.GameModeManager.INSTANCE.onEnterGameWorld(player);
     }
 
     /**
@@ -713,11 +734,12 @@ public final class GameWorldManager {
         }
     }
 
-    /** 给管理员补发 loot_tool 与 spawn_tool（背包已有则不重复给）。 */
+    /** 给管理员补发 loot_tool、chest_spawn_tool 与 spawn_tool（背包已有则不重复给）。 */
     private static void giveAdminTools(ServerPlayer player) {
         giveIfMissing(player, new ItemStack(ModItems.LOOT_TOOL));
+        giveIfMissing(player, new ItemStack(ModItems.CHEST_SPAWN_TOOL));
         giveIfMissing(player, new ItemStack(ModItems.SPAWN_TOOL));
-        player.displayClientMessage(BrText.of("已发放物资点工具和出生岛工具"), false);
+        player.displayClientMessage(BrText.of("已发放物资点工具、物资箱工具和出生岛工具"), false);
     }
 
     private static void giveIfMissing(ServerPlayer player, ItemStack stack) {
@@ -820,6 +842,155 @@ public final class GameWorldManager {
         }
     }
 
+    /**
+     * [BR-RESET] 结算 / 强停后安全卸载全部游戏维度（主线程，MatchResetManager 调用）。
+     *
+     * <p>每个已挂载的游戏维度依次：滞留乘客兜底送回主世界（并恢复进入前模式）→
+     * 清台账登记的死亡箱（方块 + 内容，不掉落）→ 收齐所有非玩家实体再逐个
+     * {@code discard()}（掉落物 / 经验球 / 刷出来的 mob；先收集是为了避免
+     * "边遍历实体视图边丢弃"的并发修改异常）→ 复用 {@link #unloadGameWorld}
+     * 撤票 → {@code save(true)} → 摘除 → {@code close()}。
+     *
+     * <p>地图重置由 {@link com.paimeng.battleroyale.game.MatchResetManager} 在本方法卸载
+     * 维度后异步删除 region / entities 文件；下一局正常进入时按模板重新复制区块数据。
+     */
+    public static void unloadMatchWorlds(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
+        MinecraftServerAccessor access = (MinecraftServerAccessor) server;
+        List<ResourceKey<Level>> keys = new ArrayList<>();
+        for (ResourceKey<Level> key : access.battleroyale$getWorlds().keySet()) {
+            if (isGameWorld(key)) {
+                keys.add(key);
+            }
+        }
+        ServerLevel overworld = server.overworld();
+        for (ResourceKey<Level> key : keys) {
+            ServerLevel world = access.battleroyale$getWorlds().get(key);
+            if (world == null) {
+                continue;
+            }
+            // 安全兜底：leave() 正常应已撤空；仍有滞留玩家就先送回主世界并恢复模式。
+            for (ServerPlayer passenger : List.copyOf(world.getPlayers(p -> true))) {
+                try {
+                    if (overworld != null) {
+                        BlockPos spawn = overworld.getSharedSpawnPos();
+                        passenger.teleportTo(overworld, spawn.getX() + 0.5, spawn.getY(),
+                                spawn.getZ() + 0.5, passenger.getYRot(), passenger.getXRot());
+                        resetSpawnToOverworld(passenger, overworld);
+                    }
+                    com.paimeng.battleroyale.game.GameModeManager.INSTANCE.onLeaveGameWorld(passenger);
+                    // [BR-INVISO] 滞留乘客兜底回大厅：一并结清背包隔离账。
+                    com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.onLeaveMatch(passenger);
+                } catch (Throwable t) {
+                    BattleRoyaleMod.LOGGER.warn("[BR-RESET] 玩家 {} 送出游戏维度失败：{}",
+                            passenger.getName().getString(), t.toString());
+                }
+            }
+            // 死亡箱：按台账清掉方块和内容（不掉到地上）。
+            try {
+                com.paimeng.battleroyale.game.DeathChestManager.clearDeathChests(world);
+                // [BR-LOOT/BR-AIRDROP 模块四 2] 本局刷出的物资箱 / 落地的空投箱同口径清除，
+                // 台账坐标随之作废，下一局从干净地图重新开始。
+                com.paimeng.battleroyale.game.LootSpawner.clearLootChests(world);
+                com.paimeng.battleroyale.game.AirdropManager.clearAirdropBoxes(world);
+            } catch (Throwable t) {
+                BattleRoyaleMod.LOGGER.warn("[BR-RESET] 清除死亡箱/物资箱/空投箱失败：{}", t.toString());
+            }
+            // 内存实体 / 掉落物：先收集再丢弃。
+            try {
+                List<Entity> junk = new ArrayList<>();
+                for (Entity entity : world.getAllEntities()) {
+                    if (!(entity instanceof Player)) {
+                        junk.add(entity);
+                    }
+                }
+                for (Entity entity : junk) {
+                    try {
+                        entity.discard();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable t) {
+                BattleRoyaleMod.LOGGER.warn("[BR-RESET] 清理游戏维度实体失败：{}", t.toString());
+            }
+            // 落盘并关闭实例（磁盘文件原样保留）。
+            unloadGameWorld(server, world);
+            BattleRoyaleMod.LOGGER.info("[BR-RESET] 游戏维度 {} 已安全卸载（实体/掉落物/死亡箱已清，磁盘文件稍后统一删除）",
+                    key.location());
+        }
+        com.paimeng.battleroyale.game.DeathChestManager.clearTracking();
+        // [BR-LOOT/BR-AIRDROP] 台账整体作废（卸载没覆盖到的维度也不留陈旧坐标记录）。
+        com.paimeng.battleroyale.game.LootSpawner.clearTracking();
+        com.paimeng.battleroyale.game.AirdropManager.clearTracking();
+    }
+
+    /** 收集所有游戏维度 region / entities 目录下的 .mca 文件，供重置线程删除。 */
+    public static List<Path> collectMatchMcaFiles(MinecraftServer server) {
+        List<Path> files = new ArrayList<>();
+        if (server == null) {
+            return files;
+        }
+        Path root = server.getWorldPath(LevelResource.ROOT).resolve(DIMENSION_NAMESPACE);
+        if (!Files.isDirectory(root)) {
+            return files;
+        }
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".mca"))
+                    .filter(path -> {
+                        Path parent = path.getParent();
+                        String name = parent == null ? "" : parent.getFileName().toString();
+                        return "region".equals(name) || "entities".equals(name);
+                    })
+                    .forEach(files::add);
+        } catch (IOException e) {
+            BattleRoyaleMod.LOGGER.warn("[BR-RESET] 扫描游戏维度 .mca 文件失败：{}", e.toString());
+        }
+        return files;
+    }
+
+    /** 将地图文件删除任务提交到游戏维度专用 IO 线程，不阻塞服务端主线程。 */
+    public static void runWorldIo(Runnable task) {
+        IO_EXECUTOR.execute(task);
+    }
+
+    /**
+     * [BR-RESPAWN-SPEC] 原版死亡重生后兜底拉回本局游戏维度。
+     * 调用者已经确认这是局内参赛者死亡；本方法只负责找到本局实例、传送到观战出生点，
+     * 不改变游戏模式（由 GameModeManager 统一用 ServerPlayer#setGameMode 设置旁观）。
+     */
+    public static boolean restoreEliminatedSpectator(ServerPlayer player) {
+        if (player == null || player.getServer() == null) {
+            return false;
+        }
+        MatchTeam team = MatchTeamManager.INSTANCE.teamOf(player.getUUID());
+        if (team == null || team.getMapId() == null || team.getMapId().isBlank()) {
+            return false;
+        }
+        MinecraftServer server = player.getServer();
+        ResourceKey<Level> key = worldKey(team.getMapId());
+        ServerLevel world = server.getLevel(key);
+        GameMap map = MapManager.INSTANCE.getMap(team.getMapId());
+        if (world == null || map == null || !isInstanceAlive(world, key)) {
+            BattleRoyaleMod.LOGGER.warn("[BR-RESPAWN-SPEC] 无法恢复玩家 {}：游戏维度实例不存在或正在卸载，key={}",
+                    player.getGameProfile().getName(), key.location());
+            return false;
+        }
+        try {
+            BlockPos target = matchLanding(map, world);
+            player.teleportTo(world, target.getX() + 0.5, target.getY(), target.getZ() + 0.5,
+                    player.getYRot(), player.getXRot());
+            player.setRespawnPosition(world.dimension(), target, player.getYRot(), false, true);
+            return true;
+        } catch (Throwable t) {
+            BattleRoyaleMod.LOGGER.warn("[BR-RESPAWN-SPEC] 玩家 {} 拉回游戏维度失败：{}",
+                    player.getGameProfile().getName(), t.toString());
+            return false;
+        }
+    }
+
     /** 离开游戏维度，返回进入前的位置；成功返回 null，失败返回错误文案。 */
     public static String leave(ServerPlayer player) {
         ServerLevel current = (ServerLevel) player.level();
@@ -838,6 +1009,10 @@ public final class GameWorldManager {
                 if (target != null) {
                     player.teleportTo(target, point.x(), point.y(), point.z(), point.yaw(), point.pitch());
                     resetSpawnToOverworld(player, target);
+                    // [BR-GAMEMODE] 离开游戏维度：恢复进入前的游戏模式。
+                    com.paimeng.battleroyale.game.GameModeManager.INSTANCE.onLeaveGameWorld(player);
+                    // [BR-INVISO] 离开游戏维度：清局内背包 + 返还原背包（无隔离记录 no-op）。
+                    com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.onLeaveMatch(player);
                     return null;
                 }
             }
@@ -846,6 +1021,10 @@ public final class GameWorldManager {
                 player.teleportTo(overworld, spawn.getX() + 0.5, spawn.getY(), spawn.getZ() + 0.5,
                         player.getYRot(), player.getXRot());
                 resetSpawnToOverworld(player, overworld);
+                // [BR-GAMEMODE] 回主世界同样恢复原模式（结算/强停后的统一路径）。
+                com.paimeng.battleroyale.game.GameModeManager.INSTANCE.onLeaveGameWorld(player);
+                // [BR-INVISO] 回主世界：清局内背包 + 返还原背包。
+                com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.onLeaveMatch(player);
                 return null;
             }
             return "主世界不可用，暂时无法离开";
@@ -1165,6 +1344,13 @@ public final class GameWorldManager {
                                     // 玩家数据随后落盘：Dimension/重生点都记为主世界，
                                     // 下次开服登录不会再报 Unknown respawn dimension。
                                     resetSpawnToOverworld(passenger, overworld);
+                                    // [BR-GAMEMODE] 关服兜底：把进维度前的模式写回玩家数据。
+                                    com.paimeng.battleroyale.game.GameModeManager.INSTANCE
+                                            .onLeaveGameWorld(passenger);
+                                    // [BR-GAMEMODE/BR-INVISO] 关服送出：随后玩家数据落盘前
+                                    // 清局内背包 + 返还原背包，主世界里不会残留局内物品。
+                                    com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE
+                                            .onLeaveMatch(passenger);
                                 } catch (Throwable ignored) {
                                 }
                             }
@@ -1197,6 +1383,9 @@ public final class GameWorldManager {
         } catch (Throwable t) {
             BattleRoyaleMod.LOGGER.warn("关服时清理游戏维度失败", t);
         } finally {
+            // [BR-INVISO] 关服收尾（必须在上面撤人返还循环之后）：内存台账最终落盘
+            // 并清空——账随存档走，换存档重进时由 load 按各自目录的文件恢复。
+            com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.onServerStopping(server);
             // [BR-WORLD-FIX] 全部静态集合彻底清空：任何一条残留都可能把上一个会话的
             // 强引用/路径带进下一个会话（单人档"退出到标题再进"是同一 JVM 换 server 实例，
             // static 是唯一跨会话的东西）。
@@ -1209,6 +1398,8 @@ public final class GameWorldManager {
             UNLOADING.clear();
             STORAGE_ROOTS.clear();
             KEYS.clear();
+            // [BR-RESET] 死亡箱台账同理：跨会话残留会把旧坐标带进新存档。
+            com.paimeng.battleroyale.game.DeathChestManager.clearTracking();
             currentServer = null;
         }
     }

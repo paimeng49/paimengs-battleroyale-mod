@@ -30,15 +30,21 @@ public final class BrText {
         return Component.literal(raw);
     }
 
-    /** 给所有在线玩家广播一条系统消息。 */
+    /** 判断玩家是否在大逃杀游戏维度；大厅和其它维度不接收局内系统通报。 */
+    public static boolean inGameWorld(ServerPlayer player) {
+        return player != null && player.level().dimension().location().getNamespace().equals("battleroyale_game");
+    }
+
+    /** 给游戏维度内的在线玩家广播一条系统消息。 */
     public static void broadcast(MinecraftServer server, String raw) {
         if (server == null) {
             return;
         }
         Component message = of(raw);
-        // [UPGRADE] 1.20.5+ 中 sendMessage(Component, boolean) 改名为 displayClientMessage
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            player.displayClientMessage(message, false);
+            if (inGameWorld(player)) {
+                player.displayClientMessage(message, false);
+            }
         }
     }
 }

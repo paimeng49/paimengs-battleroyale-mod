@@ -50,6 +50,14 @@ public final class MapEditorScreen extends Screen {
     private EditBox maxTeamsField;
     /** [BR-MATCHTEAM 模块一] 每队最大人数输入框（1~4，详情面板专用）。 */
     private EditBox maxTeamSizeField;
+    /** [BR-LOOT] 普通物资池、空投物资池与刷新上限配置（详情面板专用）。 */
+    private EditBox lootPoolField;
+    private EditBox airdropLootPoolField;
+    private EditBox maxLootBoxesField;
+    private EditBox maxAirdropsField;
+    private EditBox airdropStagesField;
+    private static final int LOOT_POOL_MAX_LEN = 16384;
+    private static final int LOOT_STAGE_MAX_LEN = 128;
     private Button saveButton;
     private Button cancelButton;
     private Button selectionButton;
@@ -88,10 +96,13 @@ public final class MapEditorScreen extends Screen {
     private Button zoneAddButton;
     private Button zoneSaveButton;
     private Button zoneCollapseButton;
-    /** 三条输入框列（等待 / 缩圈 / 半径，宽 40、列距 55）+ 删除按钮（宽 50、放不下自动换行），与 map.zonePhases 一一对应。 */
+    /** [r148 TTK 模型] 地图级圈外淘汰秒数（小数输入框）：阶段没单独配（填 0）时就用它。 */
+    private EditBox zoneGlobalTtk;
+    /** 四条输入框列（等待 / 缩圈 / 半径 / 淘汰秒，宽 40、列距 55）+ 删除按钮（宽 50、放不下自动换行），与 map.zonePhases 一一对应。 */
     private final List<EditBox> zoneWaits = new ArrayList<>();
     private final List<EditBox> zoneShrinks = new ArrayList<>();
     private final List<EditBox> zoneRadii = new ArrayList<>();
+    private final List<EditBox> zoneTkts = new ArrayList<>();
     private final List<Button> zoneDeleteButtons = new ArrayList<>();
     // ---- [BR-ZONE] r114 自适应换行布局常量（严格按用户伪代码逐条对应） ----
     /** 伪代码第 1 步：标题画完，currentY += 15 才到小标题行。 */
@@ -107,8 +118,8 @@ public final class MapEditorScreen extends Screen {
     private static final int ZONE_WRAP_DROP = 30;
     /** 每阶段结尾 currentY += 60：块内最高内容（含换行）也留 ≥30 像素空白。 */
     private static final int ZONE_BLOCK_ADVANCE = 60;
-    /** 阶段行的理想最大右边界 = startX + 220；再与面板实际右边缘取小，双保险不超屏。 */
-    private static final int ZONE_ROW_SPAN = 220;
+    /** 阶段行的理想最大右边界 = startX + 275（四列 55 + 删除按钮 50）；再与面板实际右边缘取小。 */
+    private static final int ZONE_ROW_SPAN = 275;
     /** 详情面板物资点同样一块一行：标题行 Y / 输入行 Y+22，块高 45，互不重叠。 */
     private static final int LOOT_BLOCK_HEIGHT = 45;
     /** 所有数值输入框的最大长度：放宽到 10 位，保证合理的秒数/半径不被误截；读取时仍有 clamp 兜底。 */
@@ -184,7 +195,7 @@ public final class MapEditorScreen extends Screen {
         enterButtons.clear(); lootUpdateButtons.clear(); lootDeleteButtons.clear(); mapDeleteButtons.clear();
         mapEnterGameButtons.clear(); archiveLinkButtons.clear();
         lootNames.clear(); lootFonts.clear(); originalYMap.clear(); logicalVisibleMap.clear();
-        zoneWaits.clear(); zoneShrinks.clear(); zoneRadii.clear(); zoneDeleteButtons.clear();
+        zoneWaits.clear(); zoneShrinks.clear(); zoneRadii.clear(); zoneTkts.clear(); zoneDeleteButtons.clear();
         rightPanelScrollOffset = Mth.clamp(rightPanelScrollOffset, 0.0, rightPanelMaxScroll);
 
         id = addRight(field(0, 0, 120, map.mapId));
@@ -198,6 +209,19 @@ public final class MapEditorScreen extends Screen {
         maxTeamsField.setResponder(text -> { if (detailMode) detailDirty = true; });
         maxTeamSizeField = addRight(numField(0, 0, 40, String.valueOf(map.maxTeamSize)));
         maxTeamSizeField.setResponder(text -> { if (detailMode) detailDirty = true; });
+        // [BR-LOOT] 长文本框保留完整物资池配置；面板本身可滚动，避免挤压其他设置。
+        lootPoolField = addRight(longField(0, 0, 120, map.lootPool,
+                "minecraft:iron_sword || minecraft:bow |and| minecraft:arrow 16"));
+        lootPoolField.setResponder(text -> { if (detailMode) detailDirty = true; });
+        airdropLootPoolField = addRight(longField(0, 0, 120, map.airdropLootPool,
+                "minecraft:diamond || minecraft:golden_apple"));
+        airdropLootPoolField.setResponder(text -> { if (detailMode) detailDirty = true; });
+        maxLootBoxesField = addRight(numField(0, 0, 56, String.valueOf(map.maxLootBoxes)));
+        maxLootBoxesField.setResponder(text -> { if (detailMode) detailDirty = true; });
+        maxAirdropsField = addRight(numField(0, 0, 56, String.valueOf(map.maxAirdrops)));
+        maxAirdropsField.setResponder(text -> { if (detailMode) detailDirty = true; });
+        airdropStagesField = addRight(longField(0, 0, 80, stagesText(map.airdropStages), "2,4"));
+        airdropStagesField.setResponder(text -> { if (detailMode) detailDirty = true; });
         saveButton = addRight(Button.builder(Component.literal("保存"), b -> save()).pos(0, 0).size(70, 20).build());
         cancelButton = addRight(Button.builder(Component.literal("取消"), b -> minecraft.setScreen(null)).pos(0, 0).size(70, 20).build());
         selectionButton = addRight(Button.builder(Component.literal("使用当前选区"), b -> MapEditorSync.requestSelection()).pos(0, 0).size(90, 20).build());
@@ -227,18 +251,23 @@ public final class MapEditorScreen extends Screen {
         zoneTitleButton = addRight(Button.builder(Component.literal("毒圈设置"), b -> toggleZonePanel()).pos(0, 0).size(zoneButtonWidth, 20).build());
         zoneAddButton = addRight(Button.builder(Component.literal("＋阶段"), b -> addZonePhase()).pos(0, 0).size(60, 20).build());
         zoneSaveButton = addRight(Button.builder(Component.literal("保存毒圈"), b -> saveZonePanel()).pos(0, 0).size(80, 20).build());
+        // [r148 TTK 模型] 地图级圈外淘汰秒数：满血在圈外多少秒被毒死（支持小数，默认 250）。
+        zoneGlobalTtk = addRight(decimalField(0, 0, 60, trimNumber(map.zoneTtkSeconds)));
         zoneCollapseButton = addRight(Button.builder(Component.literal("收起"), b -> toggleZonePanel()).pos(0, 0).size(44, 20).build());
         if (detailMode && zonePanelOpen) {
             List<ZonePhaseConfig> phases = map.zonePhases == null ? List.of() : map.zonePhases;
             for (int i = 0; i < phases.size(); i++) {
                 final int index = i;
                 ZonePhaseConfig phase = phases.get(i);
-                // 三个输入框：宽度固定 40、列距 55（等待 / 缩圈 / 半径），全部限长 NUM_FIELD_MAX_LEN 位；
+                // 三个整数输入框：宽度固定 40、列距 55（等待 / 缩圈 / 半径），全部限长 NUM_FIELD_MAX_LEN 位；
                 // 删除按钮宽 50，排版时超界自动换行（见 layoutZoneRow）。
-                // 伤害值不在 GUI 逐行编辑（沿用原配置，新增阶段自动递增）。
+                // [r148] 新增阶段的淘汰秒在 addZonePhase 里按示例梯度自动给。
                 zoneWaits.add((EditBox) addRight(numField(0, 0, ZONE_FIELD_WIDTH, String.valueOf(phase.waitTime))));
                 zoneShrinks.add((EditBox) addRight(numField(0, 0, ZONE_FIELD_WIDTH, String.valueOf(phase.shrinkTime))));
                 zoneRadii.add((EditBox) addRight(numField(0, 0, ZONE_FIELD_WIDTH, trimNumber(phase.radius))));
+                // [r148 TTK 模型] 第四列：本阶段圈外淘汰秒数（小数输入，0 = 跟随上面的全局值）
+                zoneTkts.add((EditBox) addRight(decimalField(0, 0, ZONE_FIELD_WIDTH,
+                        trimNumber(phase.zoneTtkSeconds))));
                 zoneDeleteButtons.add(addRight(Button.builder(Component.literal("删除"), b -> deleteZonePhase(index)).pos(0, 0).size(ZONE_DELETE_WIDTH, 20).build()));
             }
         }
@@ -289,6 +318,15 @@ public final class MapEditorScreen extends Screen {
         EditBox f = new EditBox(font, x, y, Math.max(30, w), 20, Component.literal(""));
         f.setMaxLength(NUM_FIELD_MAX_LEN);
         setFieldText(f, value);
+        return f;
+    }
+
+    /** 长文本输入框：用于物资池和阶段列表，允许空格、NBT 和分隔符。 */
+    private EditBox longField(int x, int y, int w, String value, String hint) {
+        EditBox f = new EditBox(font, x, y, Math.max(30, w), 20, Component.literal(""));
+        f.setMaxLength(hint.equals("2,4") ? LOOT_STAGE_MAX_LEN : LOOT_POOL_MAX_LEN);
+        setFieldText(f, value);
+        f.setHint(Component.literal(hint));
         return f;
     }
 
@@ -468,8 +506,38 @@ public final class MapEditorScreen extends Screen {
         detailLabel(y, "每队最大人数（1 ~ 4，默认 4）", 0xFFFFFFFF);
         y += 12;
         place(maxTeamSizeField, rightPanelX, y); y += 26;
+        // [r149 DYNCAP 模块一] 动态人数上限提示：写死的「100 人」已删除，
+        // 上限 = 最大队伍数 × 每队最大人数，随两个输入框实时联动。
+        int capTeams = Mth.clamp(number(maxTeamsField, map.maxTeams),
+                GameMap.MIN_MAX_TEAMS, GameMap.MAX_MAX_TEAMS);
+        int capSize = Mth.clamp(number(maxTeamSizeField, map.maxTeamSize),
+                GameMap.MIN_MAX_TEAM_SIZE, GameMap.MAX_MAX_TEAM_SIZE);
+        detailLabel(y, "地图人数上限 = " + capTeams + " × " + capSize + " = "
+                + (capTeams * capSize) + " 人（等待区满员后拒绝进入）", 0xFFAAAAAA);
+        y += 14;
         detailLabel(y, "独立队伍数凑满最大队伍数即自动开局；管理员可强制提前开", 0xFFAAAAAA);
         y += 14;
+        // ---- [BR-LOOT] 物资刷新配置：长字符串完整保留，面板可滚动，不会遮挡其他设置 ----
+        detailLabel(y, "普通物资池（用 || 分组，|and| 绑定必须同刷的物品，末尾可写数量）", 0xFFFFFFFF);
+        y += 12;
+        int lootPoolWidth = Math.max(120, rightPanelWidth - 4);
+        lootPoolField.setWidth(lootPoolWidth);
+        place(lootPoolField, rightPanelX + 2, y); y += 26;
+        detailLabel(y, "空投物资池（语法同普通物资池）", 0xFFFFFFFF);
+        y += 12;
+        airdropLootPoolField.setWidth(lootPoolWidth);
+        place(airdropLootPoolField, rightPanelX + 2, y); y += 26;
+        detailLabel(y, "物资箱上限（1 ~ 10000，默认 300）", 0xFFFFFFFF);
+        y += 12;
+        place(maxLootBoxesField, rightPanelX + 2, y); y += 26;
+        detailLabel(y, "空投次数上限（0 ~ 20，默认 2）", 0xFFFFFFFF);
+        y += 12;
+        place(maxAirdropsField, rightPanelX + 2, y); y += 26;
+        detailLabel(y, "空投触发阶段（英文逗号分隔，如 2,4）", 0xFFFFFFFF);
+        y += 12;
+        int stageWidth = Math.min(220, Math.max(80, rightPanelWidth - 4));
+        airdropStagesField.setWidth(stageWidth);
+        place(airdropStagesField, rightPanelX + 2, y); y += 28;
         detailLabel(y, "跳转（点了才会传送）：", 0xFFFFFFFF);
         y += 12;
         place(detailEnterEditButton, rightPanelX, y); y += 24;
@@ -497,9 +565,15 @@ public final class MapEditorScreen extends Screen {
         if (detailMode && zonePanelOpen) {
             int maxRadius = (int) Math.floor(zoneMaxRadius());
             detailLabel(y, "每阶段：等待/缩圈 30~900 秒；半径 ≥0（上限 " + maxRadius
-                    + " = 选区短边一半）；伤害沿用原值", 0xFFFFFFAA);
+                    + " = 选区短边一半）；淘汰秒 = 满血在圈外多少秒被毒死", 0xFFFFFFAA);
             y += 12;
-            detailLabel(y, "空列表 = 未自定义，开局用默认 6 阶段表（按选区缩放）", 0xFFAAAAAA);
+            detailLabel(y, "淘汰秒按 每秒伤害=生命上限÷秒数 反推（血多扛得久）；阶段填 0 = 跟随全局", 0xFFAAAAAA);
+            y += 12;
+            // [r148] 全局圈外淘汰秒数：标签在上、小数输入框在下（跟随阶段行同款排版）。
+            detailLabel(y, "全局淘汰秒（阶段填 0 用它；默认 250 秒）", 0xFFEFEFEF);
+            place(zoneGlobalTtk, rightPanelX + 2, y + ZONE_FIELD_DROP);
+            y += 12 + ZONE_FIELD_DROP + 22;
+            detailLabel(y, "空列表 = 未自定义，开局用默认 6 阶段表（淘汰梯度 250→100 秒）", 0xFFAAAAAA);
             y += 14;
             if (zoneWaits.isEmpty()) {
                 detailLabel(y, "还没有阶段：点「＋阶段」加一条，改完点「保存毒圈」写进服务器", 0xFFAAAAAA);
@@ -614,6 +688,11 @@ public final class MapEditorScreen extends Screen {
         place(zoneRadii.get(index), currentX, currentY + ZONE_FIELD_DROP);
         currentX += ZONE_COL_STEP;
 
+        // [r148 TTK 模型] 4b. 淘汰秒（本阶段圈外满血淘汰时间，0 = 跟随全局）
+        detailLabelAt(currentX, currentY, "淘汰秒", 0xFFBBBBBB);
+        place(zoneTkts.get(index), currentX, currentY + ZONE_FIELD_DROP);
+        currentX += ZONE_COL_STEP;
+
         // 5. 删除按钮（宽 50）：X + 50 超出 maxRight 就换行到最左侧
         boolean wrapped = currentX + ZONE_DELETE_WIDTH > maxRight;
         if (wrapped) {
@@ -640,7 +719,10 @@ public final class MapEditorScreen extends Screen {
         return Math.max(0.0, Math.min(spanX, spanZ) / 2.0);
     }
 
-    /** 加一条阶段：默认值 = 90/60 秒，半径取上一阶段的 0.6 倍（首阶段 0.65 倍上限），伤害递增。 */
+    /**
+     * 加一条阶段：默认值 = 90/60 秒，半径取上一阶段的 0.6 倍（首阶段 0.65 倍上限），
+     * [r148] 淘汰秒按示例梯度取（250 → 200 → … → 8，越界用最后一档）。
+     */
     private void addZonePhase() {
         if (map.zonePhases == null) map.zonePhases = new ArrayList<>();
         if (map.zonePhases.size() >= ZonePhaseConfig.MAX_PHASES) {
@@ -653,7 +735,7 @@ public final class MapEditorScreen extends Screen {
         ZonePhaseConfig phase = new ZonePhaseConfig(
                 ZonePhaseConfig.MAX_SECONDS, ZonePhaseConfig.MIN_SECONDS * 2,
                 ZonePhaseConfig.clampRadius(previous * 0.6, maxRadius),
-                (double) map.zonePhases.size() + 2.0);
+                com.paimeng.battleroyale.zone.ZoneStages.defaultTtkAt(map.zonePhases.size()));
         phase.clampIntoRange(maxRadius);
         map.zonePhases.add(phase);
         detailDirty = true;
@@ -678,17 +760,24 @@ public final class MapEditorScreen extends Screen {
         for (int i = 0; i < zoneWaits.size() && i < map.zonePhases.size(); i++) {
             ZonePhaseConfig old = map.zonePhases.get(i);
             // 读取兜底：等待/缩圈 Mth.clamp(val, 30, 900)；半径 Math.max(0, val)；
-            // 伤害沿用该阶段原值（新增阶段在 addZonePhase 里自动给递增默认值）。
+            // [r148] 淘汰秒读第四列小数框（非法输入回退该阶段原值，0 = 跟随全局）。
             int wait = Mth.clamp(number(zoneWaits.get(i), old.waitTime), 30, 900);
             int shrink = Mth.clamp(number(zoneShrinks.get(i), old.shrinkTime), 30, 900);
             double radius = Math.max(0.0, decimal(zoneRadii.get(i), old.radius));
-            ZonePhaseConfig phase = new ZonePhaseConfig(wait, shrink, radius, old.damage);
+            double ttk = Math.max(0.0, decimal(zoneTkts.get(i), old.zoneTtkSeconds));
+            ZonePhaseConfig phase = new ZonePhaseConfig(wait, shrink, radius, ttk);
             phase.clampIntoRange(maxRadius); // 再按选区短边一半夹上限（与服务端同口径）
             updated.add(phase);
         }
         map.zonePhases = updated;
+        // [r148] 全局圈外淘汰秒数：非法输入 / 负数回退现值；0 也当非法（服务端 normalize 兜底下限 1 秒）。
+        double globalTtk = decimal(zoneGlobalTtk, map.zoneTtkSeconds);
+        if (!(globalTtk > 0.0)) {
+            globalTtk = map.zoneTtkSeconds;
+        }
+        map.zoneTtkSeconds = globalTtk;
         detailDirty = false;
-        MapEditorSync.saveZonePhases(map.mapId, updated);
+        MapEditorSync.saveZonePhases(map.mapId, updated, globalTtk);
         notice = "毒圈配置已发送：" + updated.size() + " 个阶段（服务端按选区落盘，稍后自动回填）";
         init();
     }
@@ -721,6 +810,11 @@ public final class MapEditorScreen extends Screen {
         flightSpeedField.visible = detailMode; // [BR-FLIGHT-SPEED] 只在详情面板出现（草稿面板不摆位）
         maxTeamsField.visible = detailMode;    // [BR-MATCHTEAM] 同上
         maxTeamSizeField.visible = detailMode; // [BR-MATCHTEAM] 同上
+        lootPoolField.visible = detailMode;
+        airdropLootPoolField.visible = detailMode;
+        maxLootBoxesField.visible = detailMode;
+        maxAirdropsField.visible = detailMode;
+        airdropStagesField.visible = detailMode;
         detailEnterEditButton.visible = detailMode;
         detailEnterGameButton.visible = detailMode;
         detailLinkArchiveButton.visible = detailMode;
@@ -859,7 +953,7 @@ public final class MapEditorScreen extends Screen {
         if (detailMode) {
             // 详情面板：只在本地这份副本上改（换新对象，不动 savedMaps 里共享的 LootPoint），
             // 点「保存配置」时整包写回地图 JSON，不走编辑副本草稿的 RENAME_LOOT 通道。
-            map.lootPoints.set(i, new LootPoint(p.x(), p.z(),
+            map.lootPoints.set(i, new LootPoint(p.x(), p.y(), p.z(),
                     newName.isEmpty() ? p.name() : newName, newFont));
             setFieldText(lootFonts.get(i), String.valueOf(newFont));
             detailDirty = true;
@@ -888,6 +982,36 @@ public final class MapEditorScreen extends Screen {
         try { return Integer.parseInt(f.getValue().trim()); } catch (Exception e) { return fallback; }
     }
 
+    /** 阶段列表转输入框文本；null / 空列表按默认 2,4 展示。 */
+    private static String stagesText(List<Integer> stages) {
+        if (stages == null || stages.isEmpty()) return "2,4";
+        List<String> values = new ArrayList<>();
+        for (Integer stage : stages) if (stage != null) values.add(String.valueOf(stage));
+        return String.join(",", values);
+    }
+
+    /** 解析逗号分隔的毒圈阶段，忽略非法项并按 1~12 阶段上限去重排序。 */
+    private List<Integer> parseAirdropStages(EditBox field, List<Integer> fallback) {
+        List<Integer> result = new ArrayList<>();
+        for (String raw : field.getValue().split("[,，;；/\\s]+")) {
+            String token = raw.trim();
+            if (token.isEmpty()) continue;
+            try {
+                int stage = Integer.parseInt(token);
+                if (stage >= 1 && stage <= ZonePhaseConfig.MAX_PHASES && !result.contains(stage)) {
+                    result.add(stage);
+                }
+            } catch (NumberFormatException ignored) {
+                // 单个非法阶段直接跳过，不让整个配置保存失败。
+            }
+        }
+        if (result.isEmpty()) {
+            return fallback == null ? new ArrayList<>(List.of(2, 4)) : new ArrayList<>(fallback);
+        }
+        result.sort(Integer::compareTo);
+        return result;
+    }
+
     private void save() {
         String mapId = id.getValue().trim();
         if (!mapId.matches("[A-Za-z0-9_]+")) { notice = "地图ID只能使用字母、数字、下划线"; return; }
@@ -905,6 +1029,15 @@ public final class MapEditorScreen extends Screen {
             map.maxTeamSize = Mth.clamp(number(maxTeamSizeField, map.maxTeamSize),
                     GameMap.MIN_MAX_TEAM_SIZE, GameMap.MAX_MAX_TEAM_SIZE);
             map.normalizeMatchLimits();
+            // [BR-LOOT] 物资刷新配置读取：非法数字回退现值；阶段非法文本不会覆盖当前配置。
+            map.lootPool = lootPoolField.getValue().trim();
+            map.airdropLootPool = airdropLootPoolField.getValue().trim();
+            map.maxLootBoxes = Mth.clamp(number(maxLootBoxesField, map.maxLootBoxes),
+                    GameMap.MIN_MAX_LOOT_BOXES, GameMap.MAX_MAX_LOOT_BOXES);
+            map.maxAirdrops = Mth.clamp(number(maxAirdropsField, map.maxAirdrops),
+                    GameMap.MIN_MAX_AIRDROPS, GameMap.MAX_MAX_AIRDROPS);
+            map.airdropStages = parseAirdropStages(airdropStagesField, map.airdropStages);
+            map.normalizeLootConfiguration();
             // 服务端只把「显示名 / 源存档 / 飞机速度 / 物资点名字字号」合并到真实内存对象上再落盘，
             // 选区、出生点、人数上限等仍以服务端原值为准，不会被这份副本覆盖。
             MapEditorSync.sendSave(map, true);
@@ -969,6 +1102,11 @@ public final class MapEditorScreen extends Screen {
         guardTextField(flightSpeedField); // [BR-FLIGHT-SPEED]
         guardTextField(maxTeamsField);    // [BR-MATCHTEAM]
         guardTextField(maxTeamSizeField); // [BR-MATCHTEAM]
+        guardTextField(lootPoolField);
+        guardTextField(airdropLootPoolField);
+        guardTextField(maxLootBoxesField);
+        guardTextField(maxAirdropsField);
+        guardTextField(airdropStagesField);
         for (EditBox f : lootNames) guardTextField(f);
         for (EditBox f : lootFonts) guardTextField(f);
         for (EditBox f : zoneWaits) guardTextField(f);

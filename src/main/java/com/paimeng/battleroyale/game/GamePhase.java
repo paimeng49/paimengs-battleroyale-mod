@@ -22,8 +22,11 @@ public enum GamePhase {
     /** 进行中：对局运行，毒圈 / 撤离 / 跳伞等玩法逻辑挂在这个阶段。 */
     RUNNING("进行中"),
 
-    /** 已结束：展示结果，稍后自动回到 WAITING。 */
-    ENDED("已结束");
+    /** 已结束：展示结果，随后进入地图重置。 */
+    ENDED("已结束"),
+
+    /** 地图正在卸载、删除旧区块文件并准备下一局。 */
+    RESETTING("地图重置中");
 
     private final String displayName;
 
@@ -40,6 +43,11 @@ public enum GamePhase {
         // [BR-MATCHTEAM] 一旦进入 PREPARING，MatchTeam 已依据当前大厅队伍分配完成，
         // 名单锁死；此后再 join 会造成"分配后新增玩家无队可归"，故只允许 WAITING 变更。
         return this == WAITING;
+    }
+
+    /** 是否处于地图文件重置阶段，禁止玩家加入对局。 */
+    public boolean isResetting() {
+        return this == RESETTING;
     }
 
     /** 是否算“一局还没结束”的状态（用于 /paimengmods br stop 的判断）。 */

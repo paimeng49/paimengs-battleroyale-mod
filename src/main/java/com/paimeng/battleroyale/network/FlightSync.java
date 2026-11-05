@@ -71,6 +71,7 @@ public final class FlightSync {
         }
         FriendlyByteBuf buf = PacketByteBufs.create();
         buf.writeBoolean(active);
+        buf.writeBoolean(false);
         buf.writeUtf(mapId == null ? "" : mapId, 64);
         buf.writeDouble(ax);
         buf.writeDouble(az);
@@ -81,6 +82,28 @@ public final class FlightSync {
         buf.writeDouble(flightY);
         ServerPlayNetworking.send(player, ROUTE_CHANNEL, buf);
     }
+
+    /** 空投专用航线包，明确覆盖客户端普通航线状态。 */
+    public static void sendAirdropRoute(ServerPlayer player, boolean active, String mapId,
+                                        double ax, double az, double bx, double bz,
+                                        long startTick, double speed, double flightY) {
+        if (player == null || !ServerPlayNetworking.canSend(player, ROUTE_CHANNEL)) {
+            return;
+        }
+        FriendlyByteBuf buf = PacketByteBufs.create();
+        buf.writeBoolean(active);
+        buf.writeBoolean(true);
+        buf.writeUtf(mapId == null ? "" : mapId, 64);
+        buf.writeDouble(ax);
+        buf.writeDouble(az);
+        buf.writeDouble(bx);
+        buf.writeDouble(bz);
+        buf.writeLong(startTick);
+        buf.writeDouble(speed);
+        buf.writeDouble(flightY);
+        ServerPlayNetworking.send(player, ROUTE_CHANNEL, buf);
+    }
+
 
     /**
      * [BR-MTR2] 广播本 tick 的权威飞行进度给维度里所有玩家（含观战）。
@@ -111,6 +134,7 @@ public final class FlightSync {
     /** 客户端解码（在 netty 线程读包，数据拷进不可变 record 后再回主线程发布）。 */
     public static Payload decode(FriendlyByteBuf buf) {
         boolean active = buf.readBoolean();
+        boolean isAirdrop = buf.readBoolean();
         String mapId = buf.readUtf(64);
         double ax = buf.readDouble();
         double az = buf.readDouble();
@@ -119,10 +143,10 @@ public final class FlightSync {
         long startTick = buf.readLong();
         double speed = buf.readDouble();
         double flightY = buf.readDouble();
-        return new Payload(active, mapId, ax, az, bx, bz, startTick, speed, flightY);
+        return new Payload(active, isAirdrop, mapId, ax, az, bx, bz, startTick, speed, flightY);
     }
 
-    public record Payload(boolean active, String mapId, double ax, double az, double bx, double bz,
+    public record Payload(boolean active, boolean isAirdrop, String mapId, double ax, double az, double bx, double bz,
                           long startTick, double speed, double flightY) {
     }
 }

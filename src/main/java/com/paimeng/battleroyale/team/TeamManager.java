@@ -42,12 +42,13 @@ import java.util.UUID;
  * 只剩他一人则直接解散。普通队员断线 = 自动离队。队长也可以用
  * {@code /paimengmods br team transfer <玩家名>} 手动移交（{@link #transfer}）。
  *
- * <p><b>[BR-MATCHTEAM] 与局内队伍的边界</b>：本类只管大厅队（DraftGroup / LobbyTeam），
- * 写入的"队伍编号 1-99、队员编号 1-99"都是<b>大厅座次</b>，只用于大厅 HUD 排序，
- * 绝不是局内 1~4 号位；局内座号（squadIndex）与战术颜色只由 {@link MatchTeamManager}
- * 在 WAITING → PREPARING 的分配瞬间写进 MatchTeam。create / invite / accept / join
- * 等命令成功后只做两件事：改大厅队数据 + 发 {@link TeamSync} 大厅快照（match=false）
- * 刷新大厅 HUD。旧 Matchmaker 在指令路径上直接改局内编队的时代已结束，死代码已删。
+ * <p><b>[BR-MATCHTEAM / BR-NOLOBBYNUMBER] 与局内队伍的边界</b>：本类只管大厅队
+ * （DraftGroup / LobbyTeam）。<b>大厅阶段不分配任何编号、不碰任何战术色</b>：
+ * Team 里只有成员和加入顺序，create / invite / accept / join 等命令成功后
+ * 只做两件事——改大厅队数据 + 发 {@link TeamSync} 大厅快照（match=false、
+ * 成员编号恒 0），刷新大厅 HUD 的"队长 + 名字"列表。局内座号（squadIndex）、
+ * "#N队" 编号与 1黄2橙3蓝4绿 的战术颜色<b>只由 {@link MatchTeamManager}
+ * 在开局分配的瞬间</b>写进 MatchTeam，大厅侧不存在任何一份编号副本。
  *
  * <p><b>[BR-LOBBY-GATE] 状态机拦截</b>：一切大厅队伍管理（建队 / 邀请 / 接受 / 拒绝 /
  * 加入 / 审批 / 踢人 / 退队 / 移交 / 招募）只允许在 {@code WAITING}（大厅）阶段执行；
@@ -116,21 +117,14 @@ public final class TeamManager {
         return teamId == null ? null : teams.get(teamId);
     }
 
-    /** 按玩家 UUID 查询队伍编号；没有队伍返回 0。 */
+    /**
+     * 按玩家 UUID 查询大厅队伍门牌号（/team join 定位用的 1-99 队伍ID）；没有队伍返回 0。
+     * <b>[BR-NOLOBBYNUMBER]</b> 这只是队伍标识，不是局内 "#N队" 编号，
+     * 不得再拿它去查任何颜色表。
+     */
     public int teamNumberOf(UUID playerId) {
         Team team = teamOf(playerId);
         return team == null ? 0 : team.getTeamNumber();
-    }
-
-    /** 队伍统一颜色定义，客户端 HUD 与服务端队伍编号共用这组值。 */
-    public static int colorForTeamNumber(int teamNumber) {
-        return switch (teamNumber) {
-            case 1 -> 0xFFFFFF55; // 黄色
-            case 2 -> 0xFFFFAA33; // 橙色
-            case 3 -> 0xFF5599FF; // 蓝色
-            case 4 -> 0xFF55DD55; // 绿色
-            default -> 0xFFFFFFFF; // 无队伍或未定义队伍
-        };
     }
 
     // ------------------------------------------------------------------
@@ -152,14 +146,14 @@ public final class TeamManager {
         }
         String name = nameOf(player);
         Team team = new Team(UUID.randomUUID(), teamNumber, playerId);
-        team.addMember(playerId, name);                     // 队长 = 1 号
+        team.addMember(playerId, name);                     // 大厅队只记成员+加入顺序，不发编号
         teams.put(team.getTeamId(), team);
         playerToTeam.put(playerId, team.getTeamId());
         pendingInvites.remove(playerId);
 
         EventBus.INSTANCE.publish(new TeamCreatedEvent(team, playerId, name, player.server));
         TeamSync.syncTeam(team, player.server);
-        return Result.ok("已创建 " + teamNumber + " 号队伍，你是队长（队员 1 号）。"
+        return Result.ok("已创建 " + teamNumber + " 号队伍，你是队长。"
                 + "用 /paimengmods br team invite <玩家名> 拉人。");
     }
 
@@ -361,18 +355,22 @@ public final class TeamManager {
         return Result.ok("已将 " + targetName + " 踢出队伍");
     }
 
+    /**
+     * 入队统一出口（join 招募直通 / approve 审批通过都走这里）。
+     * [BR-NOLOBBYNUMBER] 只登记成员与加入顺序——不分配队内编号、不上颜色，
+     * 大厅 HUD 靠这份"队长 + 名字"快照刷新。
+     */
     private Result addMemberAndNotify(ServerPlayer player, Team team, String notice) {
         if (team.size() >= Math.max(1, GameModeStore.recruitTeamLimit())) return Result.fail("该队伍已满");
-        int number = team.addMember(player.getUUID(), nameOf(player));
-        if (number < 0) return Result.fail("该队伍已满");
+        if (!team.addMember(player.getUUID(), nameOf(player))) return Result.fail("该队伍已满");
         playerToTeam.put(player.getUUID(), team.getTeamId());
         pendingInvites.remove(player.getUUID());
         Map<UUID, JoinRequest> requests = pendingJoins.get(team.getTeamId());
         if (requests != null) requests.remove(player.getUUID());
-        EventBus.INSTANCE.publish(new PlayerJoinedTeamEvent(team, player.getUUID(), nameOf(player), number, player.server));
+        EventBus.INSTANCE.publish(new PlayerJoinedTeamEvent(team, player.getUUID(), nameOf(player), player.server));
         TeamSync.syncTeam(team, player.server);
         broadcastToTeam(team, player.server, notice);
-        return Result.ok("已加入 " + team.getTeamNumber() + " 号队伍，你的队员编号是 " + number + " 号");
+        return Result.ok("已加入 " + team.getTeamNumber() + " 号队伍。");
     }
 
     private void sendJoinRequest(ServerPlayer leader, ServerPlayer applicant) {
@@ -444,15 +442,14 @@ public final class TeamManager {
             return Result.fail("邀请你的队伍已经解散了。");
         }
         String name = nameOf(player);
-        int number = team.addMember(playerId, name);
-        if (number < 0) {
+        if (!team.addMember(playerId, name)) {
             return Result.fail("邀请你的队伍已满。");
         }
         playerToTeam.put(playerId, teamId);
 
-        EventBus.INSTANCE.publish(new PlayerJoinedTeamEvent(team, playerId, name, number, player.server));
+        EventBus.INSTANCE.publish(new PlayerJoinedTeamEvent(team, playerId, name, player.server));
         TeamSync.syncTeam(team, player.server);
-        return Result.ok("已加入 " + team.getTeamNumber() + " 号队伍，你的队员编号是 " + number + " 号。");
+        return Result.ok("已加入 " + team.getTeamNumber() + " 号队伍。");
     }
 
     // ------------------------------------------------------------------
@@ -497,8 +494,8 @@ public final class TeamManager {
         }
         // 同一个 teamId / teamNumber 重建，全员座次编号原样搬过去，只换 leaderId。
         Team current = new Team(team.getTeamId(), team.getTeamNumber(), targetId);
-        for (Team.Entry entry : team.membersSortedByNumber()) {
-            current.addMemberWithNumber(entry.playerId(), entry.name(), entry.number());
+        for (Team.Entry entry : team.membersInJoinOrder()) {
+            current.addMember(entry.playerId(), entry.name());
         }
         current.setLastRecruitAtMs(team.getLastRecruitAtMs());
         teams.put(team.getTeamId(), current);
@@ -537,7 +534,7 @@ public final class TeamManager {
             return "已离开队伍。";
         }
         String name = nameOf(player);
-        int number = team.removeMember(playerId);
+        team.removeMember(playerId);
         boolean disbanded = team.size() == 0;
         Team current = team;
         if (disbanded) {
@@ -547,10 +544,10 @@ public final class TeamManager {
                 // 队长退队：编号最小的活人接任（极简规则，不做选举）。
                 // leaderId 不可变，所以用同一个 teamId 重建 Team 对象再放回映射。
                 current = new Team(team.getTeamId(), team.getTeamNumber(),
-                        team.membersSortedByNumber().get(0).playerId());
-                for (Team.Entry entry : team.membersSortedByNumber()) {
-                    // 指定编号放回，剩下的人编号保持不变
-                    current.addMemberWithNumber(entry.playerId(), entry.name(), entry.number());
+                        team.membersInJoinOrder().get(0).playerId());
+                for (Team.Entry entry : team.membersInJoinOrder()) {
+                    // 保留大厅成员的加入顺序；这里不产生任何队内编号。
+                    current.addMember(entry.playerId(), entry.name());
                 }
                 current.setLastRecruitAtMs(team.getLastRecruitAtMs());
                 teams.put(teamId, current);
@@ -565,7 +562,7 @@ public final class TeamManager {
         }
 
         EventBus.INSTANCE.publish(new PlayerLeftTeamEvent(
-                teamId, team.getTeamNumber(), playerId, name, Math.max(number, 0), disbanded, server));
+                teamId, team.getTeamNumber(), playerId, name, disbanded, server));
         // 空快照单发给离队的本人，让 TA 的客户端清掉队友列表
         TeamSync.sendTo(server.getPlayerList().getPlayer(playerId), TeamSyncPayload.empty());
         return disbanded

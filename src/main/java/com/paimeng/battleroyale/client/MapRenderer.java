@@ -1,13 +1,17 @@
 package com.paimeng.battleroyale.client;
 
+import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.map.LootPoint;
+import com.paimeng.battleroyale.map.MapManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.level.Level;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.BufferUploader;
 import net.minecraft.client.renderer.GameRenderer;
@@ -181,6 +185,9 @@ public final class MapRenderer {
             // 物资点画在底图之上、玩家箭头之下（箭头永远最上层不被遮挡）。
             drawLootPoints(matrices, meta, 0.0, 0.0, 1.0, zoom,
                     clipLeft, clipTop, clipSize, clipSize);
+            // [BR-MINIMAP] 队友图标层：视野内精确位置、视野外按方位角贴边。
+            double hudHalf = HUD_SIZE / 2.0 / zoom;
+            drawTeammateIcons(matrices, meta, centerPx, centerPz, hudHalf, hudHalf, zoom);
             // 玩家箭头：锚点 = 玩家所在底图像素（矩阵保证贴着玩家地图位置），尺寸屏幕恒定。
             drawArrowAnchored(matrices, centerPx, centerPz, player.getYRot(), zoom);
         } finally {
@@ -257,6 +264,10 @@ public final class MapRenderer {
             // 物资点层：底图之上、玩家箭头之下。
             drawLootPoints(matrices, meta, 0.0, 0.0, 1.0, zoom,
                     clipLeft, clipTop, clipRight - clipLeft, clipBottom - clipTop);
+            // [BR-MINIMAP] 队友图标层：全屏地图同样画，视野外贴当前可视区边缘。
+            drawTeammateIcons(matrices, meta,
+                    (clipLeft + clipRight) / 2.0, (clipTop + clipBottom) / 2.0,
+                    (clipRight - clipLeft) / 2.0, (clipBottom - clipTop) / 2.0, zoom);
 
             if (player != null) {
                 double step = Math.max(1, meta.step());
@@ -289,16 +300,8 @@ public final class MapRenderer {
 
     /** 当前对局地图的底图元数据（origin / step / 像素尺寸）。 */
     private static ClientMapCache.Meta currentMeta() {
-        String mapId = ClientLootPointsState.mapId();
-        // [r122] 兜底：物资点通道的 mapId 缺失 / 还没同步时，用 Tile 包自己记录的权威
-        // mapId——两条通道的 id 理论上同源，但任何一次错位都不该让底图"凭空变黑"。
-        if (mapId == null || mapId.isEmpty() || ClientMapCache.meta(mapId) == null) {
-            String gameMapId = ClientMapCache.cachedMapId();
-            if (gameMapId != null && !gameMapId.isEmpty()) {
-                mapId = gameMapId;
-            }
-        }
-        if (mapId == null || mapId.isEmpty()) {
+        String mapId = effectiveMapId();
+        if (mapId.isEmpty()) {
             lookedUpMapId = "";
             lookedUpMeta = null;
             return null;
@@ -308,6 +311,51 @@ public final class MapRenderer {
             lookedUpMeta = ClientMapCache.meta(mapId);
         }
         return lookedUpMeta;
+    }
+
+    /**
+     * 当前底图认定的权威地图 ID：物资点通道的 mapId 优先，
+     * 缺失 / 还没同步 / 查不到元数据时回退 Tile 包记录的 mapId——
+     * 两条通道的 id 理论上同源，但任何一次错位都不该让底图“凭空变黑”，
+     * 也不该连累队友图标层（[r143] 从 currentMeta 抽出共用，闸门与底图同源）。
+     */
+    private static String effectiveMapId() {
+        String mapId = ClientLootPointsState.mapId();
+        if (mapId == null || mapId.isEmpty() || ClientMapCache.meta(mapId) == null) {
+            String gameMapId = ClientMapCache.cachedMapId();
+            if (gameMapId != null && !gameMapId.isEmpty()) {
+                mapId = gameMapId;
+            }
+        }
+        return mapId == null ? "" : mapId;
+    }
+
+    /**
+     * [r143][BR-MINIMAP] 队友图标层的独立可见性闸门。
+     *
+     * <p>旧版这里复用了物资点闸 {@code ClientLootPointsState.visibleIn}——
+     * 那道闸要求“该地图收到过至少一个物资点”才放行，导致<b>没配置物资点的地图
+     * 上队友图标整层被误杀</b>（实机症状：小地图正常、坐标包正常、就是没图标）。
+     * 队友坐标只依赖服务端 teammate_pos 包 + 维度隔离，与物资点毫无关系，
+     * 从此单独判定：
+     * <ul>
+     *   <li>当前维度必须是本模组的比赛维度（battleroyale_game 命名空间）——
+     *       大厅 / 主世界 / 别的维度一律不画（淘汰回大厅、br leave 都不串图）；</li>
+     *   <li>能解析出当前地图 ID 时，维度路径必须与它一致（一服多图不串队）；
+     *       解析不出（Tile 兜底也失败）但已在比赛维度里时选择信任服务端发包。</li>
+     * </ul>
+     */
+    private static boolean teammateLayerVisible(ResourceKey<Level> dim) {
+        if (dim == null) {
+            return false;
+        }
+        ResourceLocation value = dim.location();
+        if (!GameWorldManager.DIMENSION_NAMESPACE.equals(value.getNamespace())) {
+            return false;
+        }
+        String mapId = effectiveMapId();
+        return mapId.isEmpty()
+                || MapManager.safeId(mapId).toLowerCase().equals(value.getPath());
     }
 
     // ==================== 物资点 ====================
@@ -407,6 +455,99 @@ public final class MapRenderer {
             GuiDraw.drawTextWithShadow(matrices, text, name, x, 0.0F, 0xFFFFFFFF);
         } finally {
             matrices.popPose();
+        }
+    }
+
+    // ==================== [BR-MINIMAP] 队友图标 ====================
+
+    /** 图标黑色描边（与物资点同风格）。 */
+    private static final int TEAMMATE_OUTLINE = 0xFF000000;
+    /** 倒地图标闪烁：亮红半拍。 */
+    private static final int TEAMMATE_DOWNED_BRIGHT = 0xFFFF4444;
+    /** 倒地图标闪烁：暗红半拍（0xAA0000 同队伍 HUD 倒地色）。 */
+    private static final int TEAMMATE_DOWNED_DIM = 0xFF8B1A1A;
+    /** 贴边图标距地图可视区边缘的留白（屏幕像素）。 */
+    private static final double TEAMMATE_EDGE_MARGIN_PX = 5.0;
+
+    /**
+     * 画本队队友图标（HUD 小地图与全屏地图共用）：
+     * <ul>
+     *   <li>坐标读 {@link ClientTeammatePosState}（服务端每 0.25 秒定向同步 +
+     *       渲染侧线性插值），世界→底图像素换算与物资点同一条公式，
+     *       锚定关系由外层统一矩阵保证，绝不再开第二坐标系；</li>
+     *   <li>视野内在精确位置、视野外按<b>方位角投影</b>贴可视区边缘
+     *       （方向相对中心恒真，PUBG 式贴边）；</li>
+     *   <li>颜色按座号 1~4 固定色（复用 {@link TeamHudRenderer#colorOf}）；
+     *       倒地每 300ms 亮/暗红闪烁；已淘汰不画；自己不画（箭头就是自己）；</li>
+     *   <li>观战（已淘汰）本人看队友视角时同样生效——图标只依赖坐标包 +
+     *       维度隔离闸，不依赖本人存活状态。</li>
+     * </ul>
+     * 每帧至多 4 个 5 像素方块（含 1 次描边），零 buffer.begin、纯自包含
+     * {@link GuiDraw#fillF}，与物资点层同款渲染安全写法，不构成卡顿源。
+     */
+    private static void drawTeammateIcons(PoseStack matrices, ClientMapCache.Meta meta,
+                                          double centerX, double centerY,
+                                          double halfWidth, double halfHeight, double unitScale) {
+        Minecraft client = Minecraft.getInstance();
+        if (client.level == null || client.player == null
+                || unitScale <= 0.0 || halfWidth <= 0.0 || halfHeight <= 0.0) {
+            return;
+        }
+        // 维度隔离闸（[r143] 独立于物资点层）：只在比赛维度画队友图标，
+        // 回大厅后服务端空包清缓存 + 这道闸双重保险；地图 ID 能解析时还要求
+        // 维度与当前底图同图，一服多图不串队。
+        if (!teammateLayerVisible(client.level.dimension())) {
+            return;
+        }
+        java.util.Map<java.util.UUID, ClientTeammatePosState.Placement> placements =
+                ClientTeammatePosState.interpolatedPositions();
+        if (placements.isEmpty()) {
+            return;
+        }
+        double step = Math.max(1, meta.step());
+        double inv = 1.0 / unitScale;
+        double margin = TEAMMATE_EDGE_MARGIN_PX * inv;
+        double availX = halfWidth - margin;
+        double availY = halfHeight - margin;
+        if (availX <= 0.0 || availY <= 0.0) {
+            return; // 可视区被缩到放不下图标：整层跳过（不画贴边也不报错）。
+        }
+        java.util.UUID selfId = client.player.getUUID();
+        // 闪烁半拍：每帧算一次，全体倒地队友同步呼吸，不会各闪各的。
+        boolean blinkBright = ((System.currentTimeMillis() / 300L) & 1L) == 0L;
+        for (java.util.Map.Entry<java.util.UUID, ClientTeammatePosState.Placement> entry
+                : placements.entrySet()) {
+            if (entry.getKey().equals(selfId)) {
+                continue;
+            }
+            ClientTeammatePosState.Placement p = entry.getValue();
+            if (p.status() == com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_ELIMINATED) {
+                continue; // 需求：观战时显示的是“存活队友”，淘汰的不占图标。
+            }
+            double px = (p.x() - meta.originX()) / step;
+            double pz = (p.z() - meta.originZ()) / step;
+            double dx = px - centerX;
+            double dy = pz - centerY;
+            if (Math.abs(dx) > availX || Math.abs(dy) > availY) {
+                // 按方位角把点压回边缘：缩放系数取两轴各自可容纳比例的最小值。
+                double t = Math.min(availX / Math.max(Math.abs(dx), 1e-9),
+                        availY / Math.max(Math.abs(dy), 1e-9));
+                dx *= t;
+                dy *= t;
+            }
+            int color;
+            if (p.status() == com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_DOWNED) {
+                color = blinkBright ? TEAMMATE_DOWNED_BRIGHT : TEAMMATE_DOWNED_DIM;
+            } else {
+                color = TeamHudRenderer.colorOf(p.seat());
+            }
+            double x = centerX + dx;
+            double y = centerY + dy;
+            // 3 屏幕像素彩色点 + 1 像素黑描边（5 像素盒），尺寸恒定随 inv 换算。
+            GuiDraw.fillF(matrices, (float) (x - 2.5 * inv), (float) (y - 2.5 * inv),
+                    (float) (x + 2.5 * inv), (float) (y + 2.5 * inv), TEAMMATE_OUTLINE);
+            GuiDraw.fillF(matrices, (float) (x - 1.5 * inv), (float) (y - 1.5 * inv),
+                    (float) (x + 1.5 * inv), (float) (y + 1.5 * inv), color);
         }
     }
 

@@ -199,6 +199,9 @@ public final class WarmupManager {
                 continue;
             }
             teleportToSpawn(player);
+            // [r-FULLRESET] 热身（等待区）结束拉回出生岛中心：再过一遍满状态重置，
+            // 热身期间被误伤/摔伤的玩家进航线阶段照样满血满饱食、零效果零火。
+            FullStatusReset.apply(player);
             player.displayClientMessage(BrText.of("热身结束，航线阶段开始！"), true);
         }
         waitingPlayers.clear();

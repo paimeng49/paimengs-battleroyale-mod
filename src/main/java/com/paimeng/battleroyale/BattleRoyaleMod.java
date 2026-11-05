@@ -7,15 +7,25 @@ import com.paimeng.battleroyale.event.EventBus;
 import com.paimeng.battleroyale.event.GameStateChangedEvent;
 import com.paimeng.battleroyale.event.PlayerJoinedTeamEvent;
 import com.paimeng.battleroyale.event.PlayerLeftTeamEvent;
+import com.paimeng.battleroyale.event.PlayerDownedEvent;
+import com.paimeng.battleroyale.event.PlayerEliminatedEvent;
 import com.paimeng.battleroyale.event.TeamCreatedEvent;
 import com.paimeng.battleroyale.event.ZoneStageChangedEvent;
+import com.paimeng.battleroyale.game.ChatRouter;
 import com.paimeng.battleroyale.game.GameManager;
+import com.paimeng.battleroyale.game.GameModeManager;
 import com.paimeng.battleroyale.game.GamePhase;
 import com.paimeng.battleroyale.game.DownedManager;
 import com.paimeng.battleroyale.game.FlightManager;
+import com.paimeng.battleroyale.game.KillFeed;
+import com.paimeng.battleroyale.game.MatchResetManager;
+import com.paimeng.battleroyale.game.SettlementNotifier;
 import com.paimeng.battleroyale.item.ModItems;
+import com.paimeng.battleroyale.entity.ModEntities;
 import com.paimeng.battleroyale.game.StatsManager;
 import com.paimeng.battleroyale.game.WarmupManager;
+import com.paimeng.battleroyale.game.VictoryFireworks;
+import com.paimeng.battleroyale.config.BroadcastStore;
 import com.paimeng.battleroyale.network.TeamChat;
 import com.paimeng.battleroyale.network.ZoneSync;
 import com.paimeng.battleroyale.network.FlightSync;
@@ -49,7 +59,7 @@ import java.util.UUID;
  * <p>初始化时做六件事：
  * <ol>
  *   <li>往自定义事件总线上挂默认订阅者（状态切换、毒圈阶段变化、队伍变化的日志 + 广播 + 同步）；</li>
- *   <li>在服务端一次性注册 /paimengmods 下的 br（含 team 子树）与 qc 快捷消息指令树；</li>
+ *   <li>在服务端一次性注册 /paimengmods 下的 br（含 team 子树）指令树；</li>
  *   <li>把状态机和毒圈的 tick 检测挂到 Fabric 的 ServerTickEvents 上；</li>
  *   <li>把毒圈状态每 tick 推给客户端（客户端据此画蓝色能量墙）；</li>
  *   <li>挂玩家断线钩子，让 TeamManager 把离线的队员自动移出队伍；</li>
@@ -68,6 +78,7 @@ public final class BattleRoyaleMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        BroadcastStore.loadOrCreate();
         // [BR-MTR2] C-130 已数据化：不再生成/注册任何实体，位置由 FlightManager
         // 每 tick 计算并经 flight_tick 通道同步，客户端纯函数渲染（见 C130WorldRenderer）。
         // 1) 事件总线：状态切换、毒圈阶段变化的默认消费者。
@@ -78,9 +89,16 @@ public final class BattleRoyaleMod implements ModInitializer {
         // br start 成功后进入 PREPARING；这里先完成野排匹配，预留的出生点传送可在后续流程执行。
         bus.subscribe(GameStateChangedEvent.class, BattleRoyaleMod::onMatchmakingStateChanged);
         bus.subscribe(ZoneStageChangedEvent.class, BattleRoyaleMod::onZoneStageChanged);
+        // [BR-AIRDROP 模块三] 毒圈进入配置阶段（默认第 2、4 阶段）时拉起空投 C-130。
+        bus.subscribe(ZoneStageChangedEvent.class,
+                com.paimeng.battleroyale.game.AirdropManager.INSTANCE::onZoneStageChanged);
         bus.subscribe(TeamCreatedEvent.class, BattleRoyaleMod::onTeamCreated);
         bus.subscribe(PlayerJoinedTeamEvent.class, BattleRoyaleMod::onPlayerJoinedTeam);
         bus.subscribe(PlayerLeftTeamEvent.class, BattleRoyaleMod::onPlayerLeftTeam);
+        // [BR-TEAMHUD] 淘汰事件 → MatchTeamManager 本局名册登记 + 全队 HUD 状态联动
+        // （该成员立刻变灰色删除线；掉线重连恢复也按这份名册判定"继续打还是观战"）。
+        bus.subscribe(PlayerEliminatedEvent.class,
+                event -> MatchTeamManager.INSTANCE.onPlayerEliminated(event));
         // 本局统计（剩余存活人数 + 个人击杀数）：进入 RUNNING 时按名单初始化，
         // 离开 RUNNING 时清空并通知客户端收起 HUD。作为独立订阅者挂载，
         // 不改状态机 / 毒圈 / 队伍的现有逻辑。
@@ -88,6 +106,25 @@ public final class BattleRoyaleMod implements ModInitializer {
         bus.subscribe(GameStateChangedEvent.class, BattleRoyaleMod::onDownedStateChanged);
         // [BR-FLIGHT] 航线阶段生命周期：进入 FLIGHT 生成航线拉起玩家；中途被掐掉则全部复位。
         bus.subscribe(GameStateChangedEvent.class, BattleRoyaleMod::onFlightStateChanged);
+        // [BR-GAMEMODE] 模块一：游戏模式状态机——等待区→冒险、航线/正式局→生存、
+        // 淘汰→旁观；进维度记原模式、离开（回大厅/结算/强停）统一恢复。
+        bus.subscribe(GameStateChangedEvent.class, GameModeManager.INSTANCE::onPhaseChanged);
+        // [BR-KILLFEED] 模块二：千人千面击杀播报。必须注册在
+        // MatchTeamManager.onPlayerEliminated（上面）之后：先更新本局淘汰名册，
+        // 播报的全队覆灭判定与音效才读得到最终状态。
+        bus.subscribe(PlayerDownedEvent.class, KillFeed.INSTANCE::onPlayerDowned);
+        bus.subscribe(PlayerEliminatedEvent.class, KillFeed.INSTANCE::onPlayerEliminated);
+        // [BR-SETTLE] 模块三：淘汰行动栏提示 / 存活 3 队前三 Title / 最后 1 队吃鸡 Title。
+        bus.subscribe(PlayerEliminatedEvent.class, SettlementNotifier.INSTANCE::onPlayerEliminated);
+        bus.subscribe(GameStateChangedEvent.class, SettlementNotifier.INSTANCE::onGameStateChanged);
+        bus.subscribe(GameStateChangedEvent.class, event -> {
+            if (event.to() == GamePhase.PREPARING) {
+                KillFeed.INSTANCE.resetMatchState();
+            }
+        });
+        // [BR-RESET] 模块三第 4 条：进入 ENDED（自然结算或 br stop 强停）后
+        // 5 秒执行安全重置（倒计时由下方 tick 驱动）。
+        bus.subscribe(GameStateChangedEvent.class, MatchResetManager.INSTANCE::onGameStateChanged);
 
         // 2) 指令注册。
         // [UPGRADE] 1.19+ 改为 net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback，
@@ -103,12 +140,30 @@ public final class BattleRoyaleMod implements ModInitializer {
         ServerTickEvents.END_SERVER_TICK.register(WarmupManager.INSTANCE::tick);
         // [BR-FLIGHT] 航线推进：玩家跟随插值、跳伞落地检测（同一主线程驱动）。
         ServerTickEvents.END_SERVER_TICK.register(FlightManager.INSTANCE::tick);
+        // [BR-NAMETAG] 花名册周期重播（兜底中途进服 / 丢包的客户端），主线程驱动。
+        ServerTickEvents.END_SERVER_TICK.register(MatchTeamManager.INSTANCE::tick);
+        ServerTickEvents.END_SERVER_TICK.register(VictoryFireworks.INSTANCE::tick);
+        // [BR-MINIMAP] 队友坐标每 5 tick 定向同步到本队成员（含观战者）。
+        ServerTickEvents.END_SERVER_TICK.register(com.paimeng.battleroyale.network.TeammatePosSync::tick);
+        // [r149 MEDICAL 模块二] 医疗物品移速加成（能量饮料 / 止痛药）到期自动摘除。
+        ServerTickEvents.END_SERVER_TICK.register(
+                com.paimeng.battleroyale.item.SpeedBoostManager::tick);
+        // [BR-RESET] 进入 ENDED 后 5 秒安全重置：全员回主世界 + 清维度实体/死亡箱 +
+        // 安全卸载游戏维度（region 文件保留，下局重新实例化）。
+        ServerTickEvents.END_SERVER_TICK.register(MatchResetManager.INSTANCE::tick);
+        // [BR-LOOT 模块二] 服务端主线程每 tick 推进开局全图预铺（异步扫描器只负责找点）。
+        ServerTickEvents.END_SERVER_TICK.register(
+                com.paimeng.battleroyale.game.LootSpawner.INSTANCE::tick);
+        // [BR-AIRDROP 模块三] 空投飞机推进 / 缓降落地捕捉 / 光柱粒子。
+        ServerTickEvents.END_SERVER_TICK.register(
+                com.paimeng.battleroyale.game.AirdropManager.INSTANCE::tick);
 
         // 等待期无敌的拦截点在 mixin.LivingEntityMixin（它注入 LivingEntity.damage）：
         // 1.18.2 的 Fabric API 里只有 ServerPlayerEvents（ALLOW_DEATH 等），
         // 没有高版本的 ServerLivingEntityEvents.ALLOW_DAMAGE，所以伤害许可只能这样拦；
         // /kill 在 1.18.2 内部走的也是 LivingEntity.hurt(OUT_OF_WORLD, MAX_VALUE)，同样拦得住。
         ModItems.register();
+        ModEntities.register();
         // 4) 毒圈状态推给客户端（客户端据此画蓝色能量墙，见 client.ZoneWallRenderer）。
         ServerTickEvents.END_SERVER_TICK.register(ZoneSync::tick);
 
@@ -158,6 +213,13 @@ public final class BattleRoyaleMod implements ModInitializer {
                     } catch (Throwable t) {
                         LOGGER.warn("玩家断线时清理地图 Tile 限速记录失败", t);
                     }
+                    // [r149 MEDICAL] 断线：移速加成跟踪表摘除（属性实例随玩家对象销毁）。
+                    try {
+                        com.paimeng.battleroyale.item.SpeedBoostManager
+                                .handleDisconnect(handler.player.getUUID());
+                    } catch (Throwable t) {
+                        LOGGER.warn("玩家断线时清理移速加成失败", t);
+                    }
                 });
 
         // 玩家重生后清理旧的击倒/淘汰状态，避免下一次致命伤害被旧状态污染。
@@ -167,6 +229,13 @@ public final class BattleRoyaleMod implements ModInitializer {
                         DownedManager.INSTANCE.handleRespawn(newPlayer);
                     } catch (Throwable t) {
                         LOGGER.warn("玩家重生时清理击倒状态失败", t);
+                    }
+                    try {
+                        if (!alive) {
+                            handleInMatchDeathRespawn(newPlayer);
+                        }
+                    } catch (Throwable t) {
+                        LOGGER.warn("[BR-RESPAWN-SPEC] 玩家淘汰后恢复局内观战失败", t);
                     }
                     try {
                         EditWorldManager.handleRespawn(newPlayer);
@@ -191,6 +260,9 @@ public final class BattleRoyaleMod implements ModInitializer {
         QuickChatStore.loadOrCreate();
         PingService.INSTANCE.registerServer();
         TeamChat.registerServer();
+        // [BR-CHAT] 普通聊天三频道拦截：WAITING=[大厅]全服；局内默认=[队伍]，
+        // ".all "前缀=[全局]（本局所有玩家），无 MatchTeam 的旁观者兜底走全局。
+        ChatRouter.registerServer();
 
         // 7) 本局统计：玩家死亡（被淘汰）时更新剩余人数与击杀数，
         //    变化当场广播给所有客户端；中途进服的玩家立刻补发一份当前统计。
@@ -206,6 +278,17 @@ public final class BattleRoyaleMod implements ModInitializer {
 
         ServerPlayConnectionEvents.JOIN.register(
                 (handler, sender, server) -> StatsManager.INSTANCE.sendTo(handler.player));
+
+        // [BR-GAMEMODE 1.3] 重连兜底：离线期间本局已结束的玩家（磁盘上模式可能停在旁观/生存），
+        // 落点不在游戏维度且还有未消费的原模式记录 → 登录瞬间恢复。
+        ServerPlayConnectionEvents.JOIN.register(
+                (handler, sender, server) -> {
+                    try {
+                        GameModeManager.INSTANCE.restoreIfStale(handler.player);
+                    } catch (Throwable t) {
+                        LOGGER.warn("玩家重连时恢复游戏模式失败", t);
+                    }
+                });
 
         // [BR-ZONE] 模块六：登录瞬间按玩家所在维度补发一次毒圈状态
         // （在他维度就有快照、不在就只有 IDLE——保证主城永远拿干净状态）。
@@ -226,6 +309,30 @@ public final class BattleRoyaleMod implements ModInitializer {
                         FlightManager.INSTANCE.ensureCleanJoin(handler.player, server);
                     } catch (Throwable t) {
                         LOGGER.warn("玩家登录时清理航线残留失败", t);
+                    }
+                });
+
+        // [r149 MEDICAL] 登录兜底：移速加成是 permanent 修饰符（会进玩家存档），
+        // 不在跟踪表里的残留（关服时还挂着的）当场摘除，杜绝重连带旧 buff。
+        ServerPlayConnectionEvents.JOIN.register(
+                (handler, sender, server) -> {
+                    try {
+                        com.paimeng.battleroyale.item.SpeedBoostManager
+                                .ensureCleanJoin(handler.player);
+                    } catch (Throwable t) {
+                        LOGGER.warn("玩家登录时清理移速加成残留失败", t);
+                    }
+                });
+
+        // [BR-INVISO] 背包隔离登录兜底：局内掉线没重连的玩家，游戏结束后下次登录
+        // （落在主世界大厅）时返还原背包；重连直接落回游戏维度（还在局内）的绝不二次发放。
+        ServerPlayConnectionEvents.JOIN.register(
+                (handler, sender, server) -> {
+                    try {
+                        com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE
+                                .onLogin(handler.player, server);
+                    } catch (Throwable t) {
+                        LOGGER.warn("[BR-INVISO] 玩家登录返还原背包失败", t);
                     }
                 });
 
@@ -262,6 +369,44 @@ public final class BattleRoyaleMod implements ModInitializer {
     }
 
     /**
+     * [BR-RESPAWN-SPEC] 拦截局内淘汰后的原版重生落点：原版可能按重生点把新实体
+     * 放到主世界，这里在 AFTER_RESPAWN 立刻拉回当前游戏维度，并强制下发旁观模式。
+     * 只有结算安全重置（MatchResetManager）调用 GameWorldManager.leave 时才会离开游戏维度。
+     */
+    private static void handleInMatchDeathRespawn(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        GamePhase phase = GameManager.INSTANCE.getPhase();
+        boolean matchActive = phase.isActiveMatch() || phase == GamePhase.ENDED;
+        if (!MatchTeamManager.INSTANCE.isAssigned(player.getUUID())) {
+            if (!matchActive) {
+                // 大厅里死亡重生的普通玩家：若上一局（本局重置后已解散名单）还有未消费的
+                // 原模式记录，这里当场恢复，防止旁观模式被"焊死"带进大厅。
+                GameModeManager.INSTANCE.restoreIfStale(player);
+            }
+            return;
+        }
+        if (!matchActive) {
+            return;
+        }
+        FlightManager.INSTANCE.handleRespawn(player);
+        if (!GameWorldManager.isGameWorld(player.level().dimension())) {
+            if (!GameWorldManager.restoreEliminatedSpectator(player)) {
+                // 游戏实例已经结束/卸载时，不能把玩家留在错误的旁观模式；恢复原模式。
+                GameModeManager.INSTANCE.onLeaveGameWorld(player);
+                LOGGER.warn("[BR-RESPAWN-SPEC] 玩家 {} 的游戏维度不可用，按大厅兜底恢复模式",
+                        player.getName().getString());
+                return;
+            }
+        }
+        GameModeManager.INSTANCE.forceSpectatorAfterRespawn(player);
+        player.displayClientMessage(BrText.of("【大逃杀】你已被淘汰，正在游戏内观战；结算结束后返回大厅。"), false);
+        LOGGER.info("[BR-RESPAWN-SPEC] 玩家 {} 已留在游戏维度旁观（phase={}）",
+                player.getName().getString(), GameManager.INSTANCE.getPhase().name());
+    }
+
+    /**
      * [BR-HUD-REJOIN] 断线重连回主世界（大厅）。
      *
      * <p>玩家在游戏维度里下线时，存档记录的维度就是 {@code battleroyale_game:*}，
@@ -292,9 +437,38 @@ public final class BattleRoyaleMod implements ModInitializer {
         });
     }
 
+    /**
+     * [BR-RECONNECT] 局内掉线重连恢复：playerToTeam 映射表里还有他的 UUID
+     * （说明掉线前已被分到本局 MatchTeam）且未被淘汰 —— 允许继续游玩：
+     * <ol>
+     *   <li>重发本局队伍快照给全队（含本人）：HUD 立即恢复正确的 MatchTeam、座号
+     *       和队友状态（快照里的状态实时取自 DownedManager）；</li>
+     *   <li>补发所在地图的物资点列表（客户端断线时已清空缓存）；</li>
+     *   <li>毒圈 / 统计 / 航线残留由各 JOIN 钩子和 FlightManager.ensureCleanJoin 负责。</li>
+     * </ol>
+     * 人留在游戏维度原位继续比赛，不传送、不结算淘汰。
+     */
+    private static void restoreRejoinerToMatch(ServerPlayer player, MinecraftServer server) {
+        com.paimeng.battleroyale.team.MatchTeam team = MatchTeamManager.INSTANCE.teamOf(player.getUUID());
+        if (team == null) {
+            return;                            // 理论到不了（isAssigned 刚查到）；当旁观处理
+        }
+        MatchTeamManager.INSTANCE.resyncStatusFor(player.getUUID(), server);
+        com.paimeng.battleroyale.map.GameMap map = MapManager.INSTANCE.getMap(team.getMapId());
+        if (map != null) {
+            com.paimeng.battleroyale.network.LootPointsSync.sendTo(player, map);
+        }
+        player.displayClientMessage(BrText.of("【大逃杀】断线重连：已恢复本局队伍（#"
+                + team.getTeamNumber() + "队 " + team.squadIndexOf(player.getUUID()) + "号位），继续作战！"), false);
+        player.displayClientMessage(BrText.mutable("【大逃杀】你的队友可在队伍 HUD 上看到实时状态。").withStyle(
+                net.minecraft.ChatFormatting.GRAY), false);
+        LOGGER.info("[BR-RECONNECT] 玩家 {} 掉线重连回局：{} 队 {} 号位快照已恢复",
+                player.getGameProfile().getName(), team.getTeamNumber(),
+                team.squadIndexOf(player.getUUID()));
+    }
+
     /** 主线程执行：淘汰 / 清残留状态，然后把玩家传送回主世界并重置重生点。 */
-    private static void sendRejoinerToLobby(ServerPlayer player, MinecraftServer server) {
-        // 双保险：排队的这一 tick 里玩家可能已被其他流程送出游戏维度。
+    private static void sendRejoinerToLobby(ServerPlayer player, MinecraftServer server) {        // 双保险：排队的这一 tick 里玩家可能已被其他流程送出游戏维度。
         if (!GameWorldManager.isGameWorld(player.level().dimension())) {
             return;
         }
@@ -304,11 +478,34 @@ public final class BattleRoyaleMod implements ModInitializer {
         boolean inMatch = phase == GamePhase.PREPARING
                 || phase == GamePhase.FLIGHT
                 || phase == GamePhase.RUNNING;
+        // [BR-RECONNECT] 局内掉线重连恢复：分配过 MatchTeam 且没被淘汰的人回场继续打，
+        // 只补发局内队伍快照（HUD 恢复 MatchTeam + 座号 + 队友状态），不做逃跑结算。
+        // 淘汰判定用 MatchTeamManager 的本局名册（DownedManager 的瞬时标记会在淘汰收尾被清掉）。
+        if (inMatch && MatchTeamManager.INSTANCE.isAssigned(playerId)
+                && !MatchTeamManager.INSTANCE.wasEliminatedThisMatch(playerId)) {
+            restoreRejoinerToMatch(player, server);
+            // [BR-GAMEMODE 1.3] 掉线兜底：回场的人按当前阶段重置模式（航线/正式局→生存）。
+            GameModeManager.INSTANCE.onReconnect(player);
+            return;
+        }
         if (inMatch && GameManager.INSTANCE.isJoined(name)) {
-            // 对局名单里的人断线重连：与被击杀同一套结算（存活人数 -1、队伍坍缩检查、
-            // 淘汰事件、HUD 清除包），杜绝"人回大厅、名字还挂在存活数里"的幽灵玩家。
-            DownedManager.INSTANCE.eliminateForDesert(player);
-            BrText.broadcast(server, "【大逃杀】" + name + " 断线重连后已送回大厅，判定阵亡！");
+            if (MatchTeamManager.INSTANCE.wasEliminatedThisMatch(playerId)) {
+                // [BR-GAMEMODE 1.3] 对局进行中、本局已淘汰：留在游戏维度**保持旁观**，
+                // 不再送回大厅（旁观者免毒圈、免结算，安全）；比赛结束后随统一
+                // 安全重置一起回主世界并恢复原模式。旁观者掉线重连同走此分支——
+                // 从旁观掉线的人重连后依然是旁观模式。
+                GameModeManager.INSTANCE.onReconnect(player);
+                player.displayClientMessage(BrText.of("【大逃杀】你已被本局淘汰，重连后继续在局内旁观；本局结束会自动返回主世界。"), false);
+                LOGGER.info("[BR-GAMEMODE] 玩家 {} 淘汰后断线重连：保持局内旁观，不回大厅", name);
+                return;
+            } else {
+                // 对局名单里的人断线重连：与被击杀同一套结算（存活人数 -1、队伍坍缩检查、
+                // 淘汰事件、HUD 清除包），杜绝"人回大厅、名字还挂在存活数里"的幽灵玩家。
+                // [r-LEAVE] voluntaryQuit=false：击杀播报仍跳过（下面按"逃跑"口径广播），
+                // 但窗口期内的最后玩家伤害照样归因——被追着打然后拔线的，Kill 记给追击者。
+                DownedManager.INSTANCE.eliminateForDesert(player, false);
+                BrText.broadcast(server, "【大逃杀】" + name + " 断线重连后已送回大厅，判定阵亡！");
+            }
         }
         GameManager.INSTANCE.leave(name);
         // [BR-MATCHTEAM] 断线重连按阵亡结算的是"本局参赛资格"，大厅队伍不动：
@@ -395,20 +592,40 @@ public final class BattleRoyaleMod implements ModInitializer {
         } else if (event.from() == GamePhase.FLIGHT && event.to() != GamePhase.RUNNING) {
             FlightManager.INSTANCE.endMatch(event.server());
         }
+        // [BR-FLIGHT-VANISH] 状态切换为 RUNNING：兜底扫除游戏维度里残留的航线隐身效果
+        // （正常下机/收尾路径已逐个精准移除，这里覆盖掉线、淘汰观战等脱离名单的人）。
+        if (event.to() == GamePhase.RUNNING) {
+            FlightManager.INSTANCE.clearFlightInvisibility(event.server());
+        }
     }
 
     /** 默认订阅者：记录日志、全服广播，并联动毒圈的启停。 */
     private static void onGameStateChanged(GameStateChangedEvent event) {
         LOGGER.info("游戏状态切换: {} -> {} (累计 tick={})",
                 event.from().name(), event.to().name(), event.globalTicks());
-        BrText.broadcast(event.server(),
-                "【大逃杀】状态: " + event.from().displayName() + " -> " + event.to().displayName());
+        if (event.to() == GamePhase.PREPARING) {
+            BroadcastStore.load();
+        }
+        if (BroadcastStore.isDetailedBroadcast()) {
+            BrText.broadcast(event.server(),
+                    "【大逃杀】状态: " + event.from().displayName() + " -> " + event.to().displayName());
+        }
 
-        // 毒圈生命周期跟 RUNNING 走：开局启动，结束/强停即关。
+        // 普通物资箱从 PREPARING 就开始全图预铺，确保玩家跳伞前已经摆好。
+        if (event.to() == GamePhase.PREPARING) {
+            com.paimeng.battleroyale.game.LootSpawner.INSTANCE.start(event.server());
+        }
         if (event.to() == GamePhase.RUNNING) {
             ZoneManager.INSTANCE.start(event.server());
+            com.paimeng.battleroyale.game.AirdropManager.INSTANCE.start(event.server());
         } else if (event.from() == GamePhase.RUNNING) {
             ZoneManager.INSTANCE.stop(event.server());
+            com.paimeng.battleroyale.game.AirdropManager.INSTANCE.stop(event.server());
+            com.paimeng.battleroyale.game.LootSpawner.INSTANCE.stop(event.server());
+        }
+        if ((event.from() == GamePhase.PREPARING || event.from() == GamePhase.FLIGHT)
+                && event.to() != GamePhase.RUNNING) {
+            com.paimeng.battleroyale.game.LootSpawner.INSTANCE.stop(event.server());
         }
     }
 
@@ -419,28 +636,41 @@ public final class BattleRoyaleMod implements ModInitializer {
             case IDLE -> "【毒圈·" + zoneTag(event) + "】已关闭。";
             case WAITING -> {
                 ZoneStage s = stageOf(event);
-                // [r130 阶段零] 开局蓝圈罩住全图：这一条等待播报不讲"半径多少米"，
-                // 讲清"现在全图安全 + 白圈多大 + 什么时候开始收缩"。
-                if (event.phase0()) {
-                    yield "【毒圈·" + zoneTag(event) + "】安全区已标定（半径 " + (int) s.targetRadius()
-                            + " 米）：当前全图安全，" + s.waitSeconds() + " 秒后毒圈开始收缩，请尽快进圈！";
+                String wait = formatMinuteSecond(s.waitSeconds());
+                if (!BroadcastStore.isDetailedBroadcast()) {
+                    yield "【安全区·" + zoneTag(event) + "】安全区将在 " + wait + " 后开始调整范围。";
                 }
-                yield "【毒圈·" + zoneTag(event) + "】" + s.name() + "：半径 " + (int) event.radius()
-                        + " 米，" + s.waitSeconds() + " 秒后开始收缩（圈外每秒 "
-                        + (int) s.damagePerSecond() + " 点伤害）。";
+                if (event.phase0()) {
+                    yield "【安全区·" + zoneTag(event) + "】安全区已标定（半径 " + (int) s.targetRadius()
+                            + " 米），全图暂时安全；安全区将在 " + wait + " 后开始调整范围。";
+                }
+                yield "【安全区·" + zoneTag(event) + "】安全区将在 " + wait
+                        + " 后开始调整范围。（当前半径 " + (int) event.radius() + " 米，圈外满血约 "
+                        + com.paimeng.battleroyale.zone.ZoneManager.formatSeconds(s.zoneTtkSeconds())
+                        + " 秒淘汰）";
             }
             case SHRINKING -> {
                 ZoneStage s = stageOf(event);
-                yield "【毒圈·" + zoneTag(event) + "】" + s.name() + " 正在收缩！" + s.shrinkSeconds()
-                        + " 秒内收到 " + (int) s.targetRadius() + " 米，快进圈！";
+                if (!BroadcastStore.isDetailedBroadcast()) {
+                    yield "【安全区·" + zoneTag(event) + "】安全区正在调整范围，请尽快进圈！";
+                }
+                yield "【安全区·" + zoneTag(event) + "】安全区正在调整范围，请尽快进圈！"
+                        + "（将在 " + s.shrinkSeconds() + " 秒内调整至 " + (int) s.targetRadius() + " 米）";
             }
             case DONE -> "【毒圈·" + zoneTag(event) + "】所有阶段收缩完毕，最后的决战圈已定型。";
         };
         LOGGER.info("[BR-ZONE] 地图 {} 毒圈变化: phase={} stage={} radius={}",
                 event.mapId(), event.phase().name(), event.stageIndex(), event.radius());
-        BrText.broadcast(event.server(), message);
+        if (!event.phase().name().equals("IDLE") || BroadcastStore.isDetailedBroadcast()) {
+            BrText.broadcast(event.server(), message);
+        }
         // 阶段一切换立刻补发一次，客户端的能量墙不会等到下一次兜底广播才更新。
         ZoneSync.syncNow(event.server());
+    }
+
+    private static String formatMinuteSecond(int totalSeconds) {
+        int seconds = Math.max(0, totalSeconds);
+        return seconds >= 60 ? (seconds / 60) + " 分 " + (seconds % 60) + " 秒" : seconds + " 秒";
     }
 
     /** 播报文案里的地图标识（多地图并跑时区分是哪一家的圈）。 */
@@ -471,13 +701,13 @@ public final class BattleRoyaleMod implements ModInitializer {
     }
 
     private static void onPlayerJoinedTeam(PlayerJoinedTeamEvent event) {
-        LOGGER.info("玩家入队: {} 加入 {} 号队，队员编号 {} 号",
-                event.playerName(), event.team().getTeamNumber(), event.memberNumber());
+        LOGGER.info("玩家入队: {} 加入 {} 号队（大厅无队内编号）",
+                event.playerName(), event.team().getTeamNumber());
     }
 
     private static void onPlayerLeftTeam(PlayerLeftTeamEvent event) {
-        LOGGER.info("玩家离队: {} 离开 {} 号队（原编号 {} 号）{}",
-                event.playerName(), event.teamNumber(), event.memberNumber(),
+        LOGGER.info("玩家离队: {} 离开 {} 号队{}",
+                event.playerName(), event.teamNumber(),
                 event.disbanded() ? "，队伍已解散" : "");
     }
 }

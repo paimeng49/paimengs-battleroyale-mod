@@ -6,6 +6,7 @@ import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.map.LootPoint;
 import com.paimeng.battleroyale.mixin.ServerPlayerAccessor;
 import com.paimeng.battleroyale.network.FlightSync;
+import com.paimeng.battleroyale.network.ParachuteSync;
 import com.paimeng.battleroyale.util.BrText;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
@@ -133,6 +134,12 @@ public final class FlightManager {
     /** 当前在飞的航线（一个游戏维度一条）。只在主线程读写。 */
     private final List<Flight> flights = new ArrayList<>();
     /**
+     * [BR-AIRDROP 模块三] 每维度最近一次开局使用的航线快照：FLIGHT 收尾后仍保留，
+     * 空投 C-130 直接复用同一条 A→B 航线（含速度与高度）。下一局 warmup 重新
+     * begin 时会被新航线覆盖；对局从不手工清空。
+     */
+    private final Map<ResourceKey<Level>, RouteLine> lastRoutes = new ConcurrentHashMap<>();
+    /**
      * 热身倒计时开始时就生成的航线预告。进入 FLIGHT 时按维度取出复用，
      * 绝不重新随机，保证玩家看到的路线和飞机实际路线完全一致。
      */
@@ -171,6 +178,14 @@ public final class FlightManager {
      */
     public boolean isPlaneLocked(UUID playerId) {
         return playerId != null && planeLocked.contains(playerId);
+    }
+
+    /**
+     * [BR-AIRDROP 模块三 2] 取某维度最近一次开局生成的航线（A→B、速度、高度全套）。
+     * 本局还没跑过 FLIGHT（或从未进过游戏维度）时返回 null，调用方自行跳过空投。
+     */
+    public RouteLine routeFor(ResourceKey<Level> worldKey) {
+        return worldKey == null ? null : lastRoutes.get(worldKey);
     }
 
     /**
@@ -284,6 +299,8 @@ public final class FlightManager {
                 continue;
             }
             flights.add(flight);
+            // [BR-AIRDROP 模块三] 留存本局航线快照：毒圈中后期的空投 C-130 复用同一条 A→B。
+            lastRoutes.put(key, new RouteLine(flight));
             // [BR-MTR2] 纯函数时钟原点：以本维度当前 world.getGameTime() 为准随航线包下发。
             // 该值仅作日志/诊断参考——客户端不信任跨纪元的时间戳，第一发
             // flight_tick 权威进度包到达即在自己的时间轴上重新锚定
@@ -407,12 +424,20 @@ public final class FlightManager {
                 it.remove(); // 断线：下轮登录走 ensureCleanJoin
                 continue;
             }
+            if (!player.isAlive()) {
+                // [BR-PARA-SYNC] 缓降中死亡/淘汰：收掉降落伞状态，防止旁观尸体顶着鬼影伞。
+                player.removeEffect(MobEffects.SLOW_FALLING);
+                ParachuteSync.broadcast((ServerLevel) player.level(), id, false);
+                it.remove();
+                continue;
+            }
             if (player.onGround()) {
                 player.removeEffect(MobEffects.SLOW_FALLING);
                 // [BR-PLANE-END] 终点强制踢下的玩家可能还挂在无敌名单里（航线已
                 // 因落地超时而收尾、人却还在半空）：真正落地这一刻才一并解除。
                 flightInvincible.remove(id);
                 planeLocked.remove(id);
+                ParachuteSync.broadcast((ServerLevel) player.level(), id, false);
                 it.remove();
             }
         }
@@ -435,6 +460,12 @@ public final class FlightManager {
         player.setDeltaMovement(Vec3.ZERO);
         player.fallDistance = 0.0F;
         player.setInvisible(true); // 机上隐藏玩家模型，不挡机舱内视线（跳伞时恢复）
+        // [BR-FLIGHT-VANISH] 再叠一层原版隐身效果：setInvisible 只改实体标记，
+        // 玩家装备/手持物品在部分客户端时机仍会显形；MobEffects.INVISIBILITY 会随
+        // 实体同步包完整广播，中途进场的旁观者也能立刻看到"空机舱"。
+        // ambient=false + visible=false = 不显示粒子（隐藏粒子）；时长按"无限"给
+        // （999999 tick ≈ 13 小时，航线实际只有几分钟，下机立刻精准移除）。
+        player.addEffect(new MobEffectInstance(MobEffects.INVISIBILITY, 999999, 0, false, false));
         try {
             // [r124] 角度防呆：登机传送必须原样带上玩家当前的 yaw / pitch（1.20.1 映射
             // getYRot=水平转角、getXRot=俯仰）。旧版这里俯仰写死 0.0F，teleportTo 会用
@@ -567,6 +598,9 @@ public final class FlightManager {
         releaseVanillaCheckExemptions(player);
         // [BR-ROLLBACK] 没有骑乘就没有 stopRiding：恢复可见模型 + 恢复重力即可。
         player.setInvisible(false);
+        // [BR-FLIGHT-VANISH] 跳伞（离开飞机）：精准移除航线隐身。只 removeEffect
+        // INVISIBILITY 这一条，绝不 clear 全部效果——玩家自己另外挂的药效不受牵连。
+        player.removeEffect(MobEffects.INVISIBILITY);
         player.setNoGravity(false);           // 恢复重力
         player.setDeltaMovement(new Vec3(flight.dirX * 0.1, 0.0, flight.dirZ * 0.1)); // 清掉锁定残余速度后给前冲推力（高飘参数不变）
         player.fallDistance = 0.0F;
@@ -576,6 +610,9 @@ public final class FlightManager {
         player.addEffect(new MobEffectInstance(MobEffects.SLOW_FALLING,
                 SLOW_FALLING_TICKS, 0, false, true));
         gliding.add(player.getUUID());
+        // [BR-PARA-SYNC] 开伞状态按 UUID 广播给同维度<b>所有</b>客户端（原版药效同步
+        // 之外再叠一条模组自己的权威通道），其他玩家客户端渲染降落伞不再只依赖药效包。
+        ParachuteSync.broadcast((ServerLevel) player.level(), player.getUUID(), true);
         player.displayClientMessage(BrText.of(forcedKick
                 ? "已到达航线终点，强制跳伞！"
                 : "已跳伞！60 秒缓降中，可用方向键调整落点，落地自动恢复。"), true);
@@ -647,6 +684,10 @@ public final class FlightManager {
                     // 实体还在（只是死了）：必须归还豁免——重生会 copyFrom 旧实体的
                     // PlayerAbilities，allowFlying=true 会被带进新命。
                     releaseVanillaCheckExemptions(player);
+                    // [BR-FLIGHT-VANISH] 死亡/离场的实体还在：一并精准收回航线隐身。
+                    player.removeEffect(MobEffects.INVISIBILITY);
+                    // [BR-PARA-SYNC] 死亡/淘汰：向同维度所有客户端收掉他的降落伞。
+                    ParachuteSync.broadcast((ServerLevel) player.level(), id, false);
                 } else {
                     hadAllowFlying.remove(id);
                 }
@@ -657,6 +698,9 @@ public final class FlightManager {
                 // br leave / 被传送出维度：交还重力与无敌、通知他那个客户端收起航线，再摘除
                 player.setNoGravity(false);
                 releaseVanillaCheckExemptions(player);
+                // [BR-FLIGHT-VANISH] 离开航线维度：精准收回航线隐身。
+                player.setInvisible(false);
+                player.removeEffect(MobEffects.INVISIBILITY);
                 flightInvincible.remove(id);
                 planeLocked.remove(id);
                 FlightSync.sendRoute(player, false, flight.mapId, 0, 0, 0, 0, 0L, 0.0, 0.0);
@@ -775,6 +819,14 @@ public final class FlightManager {
                 releaseVanillaCheckExemptions(player);
                 player.setNoGravity(false);
                 player.setInvisible(false);
+                // [BR-FLIGHT-VANISH] 航线收尾（FLIGHT→RUNNING / br stop / 全员落地）：
+                // 精准移除本模组挂上的原版隐身效果。
+                player.removeEffect(MobEffects.INVISIBILITY);
+                if (!gliding.contains(id)) {
+                    // 仍在缓降名单的人（落地超时收尾时还在半空）不收伞：
+                    // 由 tickGliding 在真正落地那一刻统一广播 false。
+                    ParachuteSync.broadcast((ServerLevel) player.level(), id, false);
+                }
             } else {
                 hadAllowFlying.remove(id);
             }
@@ -790,6 +842,30 @@ public final class FlightManager {
         }
         flights.clear();
         idleTicks = 0;
+    }
+
+    /**
+     * [BR-FLIGHT-VANISH] FLIGHT → RUNNING 切换兜底扫除：给游戏维度里所有不在机上的
+     * 玩家精准移除本模组挂上的原版隐身（removeEffect 只点名 INVISIBILITY 这一条，
+     * 绝不整表清空，玩家自己的其余药效不受影响）。正常航线收尾时 dropFlight 已逐个
+     * 移除，这里兜住中途掉线、被淘汰观战等脱离 flight.players 名单的漏网者。
+     */
+    public void clearFlightInvisibility(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
+        for (ServerLevel world : server.getAllLevels()) {
+            if (!GameWorldManager.isGameWorld(world.dimension())) {
+                continue;
+            }
+            for (ServerPlayer player : new ArrayList<>(world.getPlayers(p -> true))) {
+                if (planeLocked.contains(player.getUUID())) {
+                    continue; // 理论上 RUNNING 后不会有人仍在机上：防御性保留
+                }
+                player.setInvisible(false);
+                player.removeEffect(MobEffects.INVISIBILITY);
+            }
+        }
     }
 
     // ==================================================================
@@ -835,6 +911,10 @@ public final class FlightManager {
         planeLocked.remove(player.getUUID());
         gliding.remove(player.getUUID());
         player.setNoGravity(false);
+        // [BR-FLIGHT-VANISH] 断线保存玩家 NBT 前必须摘掉航线隐身：MobEffect 会随
+        // ActiveEffects 标签落盘，不摘的话他重连回大厅会顶着一个无限时长隐身。
+        player.setInvisible(false);
+        player.removeEffect(MobEffects.INVISIBILITY);
         // [BR-MTR] 断线保存 .dat 前必须归还豁免（并发 Map + 实体字段写，netty 线程安全）。
         // 断线瞬间 allowFlying=true 若被写进玩家存档，重连后会“白嫖”创造飞行权限。
         releaseVanillaCheckExemptions(player);
@@ -851,6 +931,12 @@ public final class FlightManager {
         player.setNoGravity(false);
         flightInvincible.remove(player.getUUID());
         planeLocked.remove(player.getUUID());
+        // [BR-FLIGHT-VANISH] 登录兜底：隐身效果会随玩家存档 ActiveEffects 落盘，
+        // 崩溃等异常路径没来得及在断线时摘除的，重连进大厅/回场这一刻清掉。
+        // 重连回场的玩家已不在 flight.players 名单里（掉线时被摘除），不会再被
+        // 钉回飞机，所以这里无条件收回航线隐身是安全的。
+        player.setInvisible(false);
+        player.removeEffect(MobEffects.INVISIBILITY);
         // [BR-MTR] 登录兜底：把任何可能因崩溃/异常路径残留的豁免状态归零
         // （存档里 allowFlying 被污染的极端情况由玩家原版权限重读修正：
         // 生存模式登录时 vanilla 不主动重置该位，这里幂等 release 只在有记录时归还）。
@@ -864,9 +950,51 @@ public final class FlightManager {
             player.addEffect(new MobEffectInstance(MobEffects.SLOW_FALLING,
                     SLOW_FALLING_TICKS, 0, false, true));
             gliding.add(player.getUUID());
+            // [BR-PARA-SPEC] 中途重连补的应急伞：向同维度所有客户端广播开伞状态。
+            ParachuteSync.broadcast((ServerLevel) player.level(), player.getUUID(), true);
         } else {
             player.removeEffect(MobEffects.SLOW_FALLING);
             gliding.remove(player.getUUID());
+            // [BR-PARA-SYNC] 登录清残留：收掉可能挂在其他客户端上的鬼影伞状态。
+            ParachuteSync.broadcast((ServerLevel) player.level(), player.getUUID(), false);
+        }
+    }
+
+    /**
+     * [BR-PARA-SYNC] 原版重生（死亡后）兜底：缓降/锁定名单摘除、向同维度客户端收伞。
+     * 由主类 AFTER_RESPAWN 钩子调用。
+     */
+    public void handleRespawn(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        UUID id = player.getUUID();
+        if (gliding.remove(id)) {
+            ParachuteSync.broadcast((ServerLevel) player.level(), id, false);
+        }
+        planeLocked.remove(id);
+        flightInvincible.remove(id);
+    }
+
+    /**
+     * [r-LEAVE] br leave / 断线判阵亡专用兜底（传送回大厅<b>之前</b>调用）：
+     * 向同维度所有客户端广播收伞（正在缓降时别人不能再看到他的鬼影伞）、
+     * 从缓降名单摘除、归还零重力与飞行豁免、解除航线无敌与坐标锁定。
+     * 航线 players 表里的条目由下一 tick 的维度变化分支自动剔除并收起他的航线显示。
+     * 对不在任何飞行名单里的玩家完全幂等（静默只发一次收伞广播）。
+     */
+    public void handleDesert(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        UUID id = player.getUUID();
+        gliding.remove(id);
+        planeLocked.remove(id);
+        flightInvincible.remove(id);
+        player.setNoGravity(false);
+        releaseVanillaCheckExemptions(player);
+        if (player.level() instanceof ServerLevel level) {
+            ParachuteSync.broadcast(level, id, false);
         }
     }
 
@@ -1034,7 +1162,68 @@ public final class FlightManager {
     // 内部数据结构
     // ==================================================================
 
-    /** 一条航线（一个游戏维度）。 */
+    /**
+     * 一条航线（一个游戏维度）。
+     *
+     * [BR-AIRDROP 模块三] 对外暴露的只读航线快照：空投飞机直接复用开局航线
+     * 的 A→B 端点、速度与高度（{@link #routeFor}），不再重新随机。
+     */
+    public static final class RouteLine {
+        public final ResourceKey<Level> worldKey;
+        public final String mapId;
+        public final double ax;
+        public final double az;
+        public final double bx;
+        public final double bz;
+        public final double dirX;
+        public final double dirZ;
+        public final double length;
+        public final double speed;
+        public final double flightY;
+        /** 飞完全程需要的 tick 数（与开局航线同一口径）。 */
+        public final int totalTicks;
+
+        /** 为中途空投按指定 A→B 端点创建独立航线，不读取开局航线缓存。 */
+        public static RouteLine create(ResourceKey<Level> worldKey, String mapId,
+                                        double ax, double az, double bx, double bz,
+                                        double flightY, double speed) {
+            double safeSpeed = Double.isFinite(speed) ? Mth.clamp(speed, 0.5, 20.0) : 4.0;
+            return new RouteLine(worldKey, mapId, ax, az, bx, bz, flightY, safeSpeed);
+        }
+
+        private RouteLine(ResourceKey<Level> worldKey, String mapId,
+                          double ax, double az, double bx, double bz,
+                          double flightY, double speed) {
+            this.worldKey = worldKey;
+            this.mapId = mapId == null ? "" : mapId;
+            this.ax = ax;
+            this.az = az;
+            this.bx = bx;
+            this.bz = bz;
+            this.dirX = (bx - ax) / Math.hypot(bx - ax, bz - az);
+            this.dirZ = (bz - az) / Math.hypot(bx - ax, bz - az);
+            this.length = Math.hypot(bx - ax, bz - az);
+            this.speed = speed;
+            this.flightY = flightY;
+            this.totalTicks = Math.max(1, (int) Math.ceil(this.length / this.speed));
+        }
+
+        RouteLine(Flight flight) {
+            this.worldKey = flight.worldKey;
+            this.mapId = flight.mapId;
+            this.ax = flight.ax;
+            this.az = flight.az;
+            this.bx = flight.bx;
+            this.bz = flight.bz;
+            this.dirX = flight.dirX;
+            this.dirZ = flight.dirZ;
+            this.length = flight.length;
+            this.speed = flight.speed;
+            this.flightY = flight.flightY;
+            this.totalTicks = flight.totalTicks;
+        }
+    }
+
     private static final class Flight {
         final ResourceKey<Level> worldKey;
         final String mapId;

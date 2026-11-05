@@ -46,6 +46,10 @@ public final class ClientZoneState {
 
     private static volatile int remainingSeconds = 0;
     private static volatile double progress = 0.0;
+    /** [BR-ZONE-HUD 模块四] 当前阶段圈外淘汰 TTK（秒）；0 = 不掉血（阶段零 / 没配）。 */
+    private static volatile double zoneTtkSeconds = 0.0;
+    /** [r198 协议 v3] 服务端逐玩家同步的圈外每秒伤害 DPS；0 = 不掉血。 */
+    private static volatile double zoneDamagePerSecond = 0.0;
 
     private ClientZoneState() {
     }
@@ -72,6 +76,9 @@ public final class ClientZoneState {
         whiteRadius = snapshot.whiteRadius();
         remainingSeconds = snapshot.remainingSeconds();
         progress = snapshot.clampedProgress();
+        zoneTtkSeconds = snapshot.zoneTtkSeconds();
+        zoneDamagePerSecond = Math.max(0.0, snapshot.damagePerSecond());
+        ZoneTtkCountdown.onZoneUpdated();
         present = true;
     }
 
@@ -90,6 +97,9 @@ public final class ClientZoneState {
         whiteRadius = 0.0;
         remainingSeconds = 0;
         progress = 0.0;
+        zoneTtkSeconds = 0.0;
+        zoneDamagePerSecond = 0.0;
+        ZoneTtkCountdown.reset();
     }
 
     /**
@@ -165,6 +175,30 @@ public final class ClientZoneState {
 
     public static double progress() {
         return progress;
+    }
+
+    public static double zoneTtkSeconds() {
+        return zoneTtkSeconds;
+    }
+
+    /** [r198] 服务端逐玩家同步的圈外每秒伤害 DPS；0 = 不掉血 / 未收到新包。 */
+    public static double zoneDamagePerSecond() {
+        return zoneDamagePerSecond;
+    }
+
+    /**
+     * 当前生效的圈外 DPS：优先用服务端逐玩家同步的 v3 字段；
+     * 兼容兜底：旧口径下用 最大血量 / TTK 反推（服务端伤害模型同款公式）。
+     */
+    public static double effectiveDamagePerSecond(double maxHealth) {
+        if (zoneDamagePerSecond > 0.0) {
+            return zoneDamagePerSecond;
+        }
+        double ttk = zoneTtkSeconds;
+        if (ttk > 0.0 && maxHealth > 0.0) {
+            return maxHealth / ttk;
+        }
+        return 0.0;
     }
 
     /** 实时蓝圈半径 = lerp(收缩起点 → 白圈, 总进度)：需求模块三的客户端插值。 */

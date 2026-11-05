@@ -5,7 +5,10 @@ plugins {
 version = project.mod_version
 group = project.maven_group
 
-repositories { mavenCentral() }
+repositories {
+    maven { url = 'https://maven.fabricmc.net/' }
+    mavenCentral()
+}
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"

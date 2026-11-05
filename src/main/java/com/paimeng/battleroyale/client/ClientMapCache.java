@@ -89,6 +89,8 @@ public final class ClientMapCache {
     private static final Map<String, Meta> META = new ConcurrentHashMap<>();
     /** 上次按之排队的全图元数据；换图 / 底图重建（尺寸变了）时重新排队。 */
     private static Meta queuedForMeta;
+    /** [r144] 本轮全图队列是否已打过"下载完成"验收行；建队 / 清缓存时复位。 */
+    private static boolean fullDownloadAnnounced;
 
     private static long lastBootstrapMs;
     /** 上一次真正发出请求的时刻（毫秒）：发送节奏用，见 {@link #SEND_INTERVAL_MS}。 */
@@ -161,11 +163,8 @@ public final class ClientMapCache {
         MapBaseTexture.onTileCached(mapId, META.get(mapId), payload.tileX(), payload.tileZ(), colors);
         // 这块彻底到手：从去重集合销账，之后的重复响应包不会再入队。
         QUEUED.remove(key);
-        if (QUEUE.isEmpty() && PENDING.isEmpty()) {
-            // [BR-ARROW-AND-SPEED] 验收点：全图队列顺利清空，日志明确打出来。
-            BattleRoyaleMod.LOGGER.info("[BR-MAP-C3] 全图底图下载完成：队列已清空，共缓存 {} 块（mapId={}）",
-                    TILES.size(), mapId);
-        }
+        // [BR-ARROW-AND-SPEED] 验收点：全图队列顺利清空，日志明确打出来。
+        maybeAnnounceComplete(mapId);
         BattleRoyaleMod.LOGGER.info("[BR-MAP-C2] 收到 Tile 数据 mapId={} tile=({}, {}) 尺寸={}x{}，"
                         + "缓存 {} 块，队列剩 {} 块",
                 mapId, payload.tileX(), payload.tileZ(), payload.width(), payload.height(),
@@ -238,6 +237,21 @@ public final class ClientMapCache {
             PENDING_CODES.put(key, code);
             MapTileSync.requestTile(mapId, tx, tz);
         }
+        // [r144] pollSendable 会把「其实已缓存」的陈旧队尾条目悄悄丢掉：
+        // 丢完这一刻 QUEUE 才真正清空，补一次验收判定（本次日志缺的就是这行）。
+        maybeAnnounceComplete(mapId);
+    }
+
+    /** [r144] 验收行只打一次：QUEUE 与 PENDING 都空且至少缓存过一块时宣布完成。 */
+    private static void maybeAnnounceComplete(String mapId) {
+        if (fullDownloadAnnounced || queuedForMeta == null || TILES.isEmpty()) {
+            return;
+        }
+        if (QUEUE.isEmpty() && PENDING.isEmpty()) {
+            fullDownloadAnnounced = true;
+            BattleRoyaleMod.LOGGER.info("[BR-MAP-C3] 全图底图下载完成：队列已清空，共缓存 {} 块（mapId={}）",
+                    TILES.size(), mapId);
+        }
     }
 
     /**
@@ -280,6 +294,7 @@ public final class ClientMapCache {
                 .comparingLong((Long code) -> dist2(decodeX(code) - cx, decodeZ(code) - cz))
                 .thenComparingLong(code -> (long) decodeZ(code) * 65536L + decodeX(code)));
         QUEUE.addAll(all);
+        fullDownloadAnnounced = false;
         // 队列刚按玩家当前位置排好：把重排锚点也定在这里，移动满 16 格才会再排。
         if (client.player != null) {
             resortAnchorX = client.player.getX();
@@ -413,6 +428,7 @@ public final class ClientMapCache {
         QUEUED.clear();
         META.clear();
         queuedForMeta = null;
+        fullDownloadAnnounced = false;
         cachedMapId = "";
         lastBootstrapMs = 0;
         lastSendMs = 0;

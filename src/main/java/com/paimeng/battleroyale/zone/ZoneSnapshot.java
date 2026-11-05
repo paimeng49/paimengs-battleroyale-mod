@@ -22,12 +22,25 @@ public record ZoneSnapshot(ZonePhase phase, int stageIndex,
                            String mapId, String dimensionId,
                            double blueCenterX, double blueCenterZ, double blueRadius,
                            double whiteCenterX, double whiteCenterZ, double whiteRadius,
-                           int remainingSeconds, double progress) {
+                           int remainingSeconds, double progress, double zoneTtkSeconds,
+                           // [r198 协议 v3] 圈外每秒伤害 DPS：服务端按"该玩家实际最大血量 / 本阶段 TTK"
+                           // 逐人算好随包下发。客户端淘汰倒计时改为纯时间预测 ceil(血量 / DPS)，
+                           // 不再依赖血量真的掉（低 DPS 阶段血量在小数池里攒着，整数血量长时间不动，
+                           // 旧公式就会卡死）。
+                           double damagePerSecond) {
 
     /** 一个"毒圈关闭"的哨兵快照：客户端收到就清空本地状态、不再画墙/圈/进度条。 */
     public static ZoneSnapshot idle() {
         return new ZoneSnapshot(ZonePhase.IDLE, -1, "", "",
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0);
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0);
+    }
+
+    /** 替换 damagePerSecond 生成新快照（服务端按玩家逐个注入 DPS 用，record 没有 wither）。 */
+    public ZoneSnapshot withDamagePerSecond(double dps) {
+        return new ZoneSnapshot(phase, stageIndex, mapId, dimensionId,
+                blueCenterX, blueCenterZ, blueRadius,
+                whiteCenterX, whiteCenterZ, whiteRadius,
+                remainingSeconds, progress, zoneTtkSeconds, dps);
     }
 
     /** 毒圈是否正在生效（决定客户端画不画）。 */

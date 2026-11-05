@@ -1,7 +1,7 @@
 package com.paimeng.battleroyale.client;
 
 import com.paimeng.battleroyale.BattleRoyaleMod;
-import com.paimeng.battleroyale.team.TeamManager;
+import com.paimeng.battleroyale.map.GameWorldManager;
 import java.util.UUID;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -37,6 +37,13 @@ public final class MapHudRenderer {
         LocalPlayer player = client.player;
         // 任何界面（包括全屏地图）打开时都不画常驻 HUD：两套坐标不会同屏，也互不覆盖。
         if (player == null || client.options.hideGui || client.screen != null) {
+            return;
+        }
+        // [BR-HUD-DIM] 维度隔离闸：右上角小地图（连同正下方的缩圈进度条）只属于
+        // 吃鸡比赛维度 battleroyale_game:*。主世界（大厅）、编辑维度等一律直接返回——
+        // 否则回到大厅后 ClientMapCache 里还留着上一局的底图切片，会画出一张
+        // 和脚下地形无关的“鬼影小地图”。判断与 StatsHudRenderer 的维度闸同款。
+        if (client.level == null || !GameWorldManager.isGameWorld(client.level.dimension())) {
             return;
         }
         int scaledWidth = client.getWindow().getGuiScaledWidth();
@@ -101,8 +108,22 @@ public final class MapHudRenderer {
         matrices.popPose();
     }
 
-    /** 供后续队友标记复用：按玩家 UUID 返回队伍颜色。 */
+    /**
+     * 供后续队友标记复用：按玩家 UUID 返回队伍颜色。
+     * [BR-NOLOBBYNUMBER] 战术色只属于局内 MatchTeam —— 大厅快照（match=false）
+     * 一律回退白色，不再拿大厅队伍门牌号去查颜色表。
+     */
     public static int getTeamColor(UUID playerUuid) {
-        return TeamManager.colorForTeamNumber(ClientTeamState.teamNumberOf(playerUuid));
+        if (!ClientTeamState.isMatch()) {
+            return 0xFFFFFFFF;
+        }
+        int teamNumber = ClientTeamState.teamNumberOf(playerUuid);
+        return switch (teamNumber) {
+            case 1 -> 0xFFFFFF55; // 黄色
+            case 2 -> 0xFFFFAA33; // 橙色
+            case 3 -> 0xFF5599FF; // 蓝色
+            case 4 -> 0xFF55DD55; // 绿色
+            default -> 0xFFFFFFFF;
+        };
     }
 }

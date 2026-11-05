@@ -154,7 +154,26 @@ public final class GameManager {
         return true;
     }
 
-    /** /paimengmods br stop：强制结束本局（进入 ENDED，稍后自动回大厅）。 */
+    /** 结算展示结束后进入地图重置阶段。 */
+    public boolean beginReset(MinecraftServer server) {
+        if (phase != GamePhase.ENDED) {
+            return false;
+        }
+        transitionTo(GamePhase.RESETTING, server);
+        return true;
+    }
+
+    /** 重置完成后回到大厅，并清空上一局报名名单。 */
+    public boolean finishReset(MinecraftServer server) {
+        if (phase != GamePhase.RESETTING) {
+            return false;
+        }
+        roster.clear();
+        transitionTo(GamePhase.WAITING, server);
+        return true;
+    }
+
+    /** /paimengmods br stop：强制结束本局（进入 ENDED，稍后开始地图重置）。 */
     public boolean requestStop(MinecraftServer server) {
         if (!phase.isActiveMatch()) {
             return false;
@@ -193,17 +212,28 @@ public final class GameManager {
             case RUNNING -> {
                 // [BR-MATCHTEAM 模块四] 胜负判定基于 MatchTeam：存活队伍数只剩 1 支（或 0）即分出冠军；
                 // 名单清空 / 超时两个兜底条件保留。
-                if (roster.isEmpty()
-                        || com.paimeng.battleroyale.team.MatchTeamManager.INSTANCE.isMatchDecided()
-                        || phaseTicks >= GameRules.MATCH_MAX_TICKS) {
+                // [BR-WINGUARD] 三个触发条件分别判断并写日志，杜绝静默 ENDED。
+                boolean everyoneLeft = roster.isEmpty();
+                boolean championCrown =
+                        com.paimeng.battleroyale.team.MatchTeamManager.INSTANCE.isMatchDecided();
+                boolean timedOut = phaseTicks >= GameRules.MATCH_MAX_TICKS;
+                if (everyoneLeft || championCrown || timedOut) {
+                    com.paimeng.battleroyale.BattleRoyaleMod.LOGGER.info(
+                            "[BR-GAME] RUNNING -> ENDED 触发: 名单清空={}, 分出冠军(存活队伍={}, 开局队伍={}), 超时(第{}tick)",
+                            everyoneLeft,
+                            com.paimeng.battleroyale.team.MatchTeamManager.INSTANCE.aliveTeamCount(),
+                            com.paimeng.battleroyale.team.MatchTeamManager.INSTANCE.startedTeamCount(),
+                            phaseTicks);
                     transitionTo(GamePhase.ENDED, server);
                 }
             }
             case ENDED -> {
                 if (phaseTicks >= GameRules.ENDED_RESET_TICKS) {
-                    roster.clear();
-                    transitionTo(GamePhase.WAITING, server);
+                    transitionTo(GamePhase.RESETTING, server);
                 }
+            }
+            case RESETTING -> {
+                // 地图删除与模板重载由 MatchResetManager 的异步流程驱动。
             }
             default -> {
                 // WAITING：自动开局由 WarmupManager 检测独立队伍数后调 requestStart

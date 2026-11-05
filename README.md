@@ -12,6 +12,7 @@ Minecraft **1.18.2 / Fabric** 模组：游戏状态机 + 毒圈收缩 + 毒圈�
 
 ```
 build.gradle                        构建脚本（loom 1.10.5，勿改依赖版本）
+gradle.properties                   版本坐标（1.18.2 / yarn build 4 / loader 0.16.14 / fabric-api 0.77.0）
 settings.gradle
 src/main/resources/
   fabric.mod.json                   模组元数据（id=battleroyale，入口=BattleRoyaleMod）
@@ -31,10 +32,10 @@ src/main/java/com/paimeng/battleroyale/
     ZoneStages.java                 静态默认阶段表 + 初始半径 + 伤害间隔（以后可换成读配置）
     ZoneManager.java                毒圈核心：圆心+半径、阶段推进、线性收缩、圈外伤害结算
   command/
-    CommandRoots.java               全模组指令命名空间唯一来源（/paimengmods + br/qc 两分支）
+    CommandRoots.java               全模组指令命名空间唯一来源（/paimengmods + br）
     BrCommand.java                  /paimengmods br join|leave|start|stop|setcenter|team ...
   config/                           ―― 本轮新增：服务端/客户端共用配置 ――
-    QuickChatStore.java             quickchat.json 预设列表读写（客户端建议 + 服务端校验）
+    QuickChatStore.java             quickchat.json 预设列表读写（客户端快捷栏 + 服务端校验）
   team/                             ―― 队伍 + 标点服务端 ――
     Team.java                       队伍对象（队伍ID/队内编号 1-99/成员名单）
     TeamManager.java                建队/邀请/接受/退队/断线清理 + 数据变化立即同步

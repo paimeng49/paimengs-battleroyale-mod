@@ -1,5 +1,7 @@
 package com.paimeng.battleroyale.client;
 
+import com.paimeng.battleroyale.BattleRoyaleMod;
+
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.player.AbstractClientPlayer;
@@ -64,15 +66,45 @@ public final class ParachuteFeatureRenderer
         this.model = new ParachuteModel();
     }
 
+    /** [BR-PARA-DEBUG] 其他玩家降落伞渲染状态日志节流：UUID → 上次打印时间戳。 */
+    private static final java.util.Map<java.util.UUID, Long> LAST_LOG_MS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long LOG_INTERVAL_MS = 2000L;
+
     @Override
     public void render(PoseStack matrices, MultiBufferSource vertexConsumers, int light,
                        AbstractClientPlayer player, float limbAngle, float limbDistance,
                        float tickDelta, float animationProgress, float headYaw, float headPitch) {
-        // 判定：带缓降效果 + 还没落地（服务端 FlightManager 落地时会清掉 SLOW_FALLING）。
-        if (this.model.isEmpty()
-                || !player.hasEffect(MobEffects.SLOW_FALLING)
-                || player.onGround()
-                || player.isInvisible()) {
+        if (this.model.isEmpty()) {
+            return;
+        }
+        // [BR-PARA-SYNC] 双通道判定：模组自己的 parachute_state 广播包（对同维度
+        // 所有客户端发，最权威），或原版缓降药效（兜底，防状态包丢失窗口）。
+        // 任一为真且没落地就画伞——不再只依赖药效是否同步到他人客户端。
+        boolean synced = ClientParachuteState.isParachuting(player.getUUID());
+        boolean effected = player.hasEffect(MobEffects.SLOW_FALLING);
+        boolean show = (synced || effected) && !player.onGround() && !player.isInvisible();
+
+        AbstractClientPlayer self = net.minecraft.client.Minecraft.getInstance().player;
+        if (self == null || !self.getUUID().equals(player.getUUID())) {
+            // [BR-PARA-DEBUG] 只给"其他玩家"打日志：确认是没进渲染循环（完全没有本行）、
+            // 还是状态没同步（synced/effected 为 false）。每人每 2 秒一条，防刷屏。
+            if (synced || effected || player.isInvisible()) {
+                long now = System.currentTimeMillis();
+                Long last = LAST_LOG_MS.get(player.getUUID());
+                if (last == null || now - last >= LOG_INTERVAL_MS) {
+                    LAST_LOG_MS.put(player.getUUID(), now);
+                    BattleRoyaleMod.LOGGER.info(
+                            "[BR-PARA] 他人降落伞 uuid={} synced={} hasSlowFalling={} onGround={} invisible={} -> {}",
+                            player.getUUID(), synced, effected, player.onGround(),
+                            player.isInvisible(), show ? "渲染" : "跳过");
+                }
+            } else {
+                LAST_LOG_MS.remove(player.getUUID());
+            }
+        }
+
+        if (!show) {
             return;
         }
 

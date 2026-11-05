@@ -14,6 +14,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MinecraftServerMixin {
     @Inject(method = "createLevels(Lnet/minecraft/server/level/progress/ChunkProgressListener;)V", at = @At("TAIL"))
     private void battleroyale$registerEditWorlds(ChunkProgressListener listener, CallbackInfo ci) {
+        // [BR-INVISO] 先恢复上一个会话没结清的背包隔离台账（按当前存档目录读盘），
+        // 必须赶在玩家登录前完成，登录兜底 onLogin 才有账可查。
+        com.paimeng.battleroyale.game.InventoryIsolation.INSTANCE.load((MinecraftServer) (Object) this);
         EditWorldManager.registerAll((MinecraftServer) (Object) this);
         // 磁盘上已有数据的游戏维度在启动时就挂进 worlds：玩家登录时原版
         // PlayerManager.createPlayer 按存档里的 Dimension 键查世界，查不到会报

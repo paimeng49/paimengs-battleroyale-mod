@@ -4,12 +4,14 @@ import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.event.EventBus;
 import com.paimeng.battleroyale.event.ZoneStageChangedEvent;
 import com.paimeng.battleroyale.game.DownedManager;
+import com.paimeng.battleroyale.game.FlightManager;
 import com.paimeng.battleroyale.game.GameManager;
 import com.paimeng.battleroyale.game.GameRules;
+import com.paimeng.battleroyale.game.WarmupManager;
+import com.paimeng.battleroyale.game.ZoneDamage;
 import com.paimeng.battleroyale.map.GameMap;
 import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.map.ZonePhaseConfig;
-import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
@@ -18,10 +20,14 @@ import net.minecraft.world.level.Level;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
 
 /**
  * 毒圈核心管理器（r109 重构：一个游戏维度一份毒圈运行时）。
@@ -53,12 +59,31 @@ import java.util.Random;
  * <p>生命周期：GameManager 进入 RUNNING 时 {@link #start}，离开 RUNNING 时 {@link #stop}；
  * IDLE（没有任何运行时）时 {@link #tick} 直接返回，零副作用。
  *
+ * <p>[r148 毒圈 TTK 模型] 圈外掉血不再"每秒直接 hurt 一个浮点数"：
+ * 每个局内玩家在 {@link ZoneRuntime#accumulatedZoneDamage} 里有一个 float 池，
+ * 每秒加进 {@code damagePerSecond = player.getMaxHealth() / 当前阶段淘汰秒数}
+ * （double，0.08、2.5 这种小数都合法），
+ * <b>攒满 1 点才真扣 1 点</b>，零头留在池子里滚下一秒；进安全区立刻清零。
+ * 扣血走自定义伤害类型 {@code battleroyale:zone_damage}（绕过护甲 + 无敌帧 + 抗性），
+ * 详见 {@link com.paimeng.battleroyale.game.ZoneDamage}。
+ *
  * <p>升级预留：只有 {@link ZoneRuntime#applyZoneDamage} 里一处碰易变 API
- * （DamageSource 常量取法，已标 [UPGRADE]）；ResourceKey 比对在高版本换 LevelKey，一行事。
+ * （伤害源构造，已收进 {@link ZoneDamage}）；ResourceKey 比对在高版本换 LevelKey，一行事。
  */
 public final class ZoneManager {
 
     public static final ZoneManager INSTANCE = new ZoneManager();
+
+    /**
+     * [r148] 秒数文案：整数不带 .0，小数原样（250 / 12.5 / 8 都要一眼看得懂）。
+     * 播报、GUI 回执、日志共用（放在外层类，{@code ZoneRuntime} 内外都能直接调）。
+     */
+    public static String formatSeconds(double value) {
+        if (value == Math.rint(value) && !Double.isInfinite(value)) {
+            return String.valueOf((long) value);
+        }
+        return String.valueOf(Math.round(value * 100.0) / 100.0);
+    }
 
     /** 每个游戏维度一份毒圈运行时；只在服务端主线程读写，不需要并发容器。 */
     private final Map<ResourceKey<Level>, ZoneRuntime> runtimes = new LinkedHashMap<>();
@@ -112,6 +137,7 @@ public final class ZoneManager {
             zone.stageIndex = -1;
             zone.stageTicks = 0;
             zone.phaseZero = false;
+            zone.clearZoneDamagePools();   // [r147] 下一局从零开始攒伤害，不带上本局的零头
         }
         runtimes.clear();
         if (server != null) {
@@ -215,6 +241,27 @@ public final class ZoneManager {
         /** [r130 阶段零] 还没走完第一次收缩前为 true：全图安全，播报 / 渲染按它防呆。 */
         private boolean phaseZero = true;
 
+        /**
+         * [r148 伤害累加器] 圈外伤害的小数池：玩家 UUID → 还没攒满 1 点的零头
+         * （外加"本秒应加但还没结算"的部分，结算后一定 &lt; 1.0）。
+         *
+         * <p>为什么必须有它：原版 {@code hurt()} 打完就把 {@code invulnerableTime} 设成
+         * 10~20 tick，紧接着的第二次结算会被整段吞掉；TTK 反推出来的伤害常常
+         * 不到 1 点（第 1 阶段 0.08 点/秒），直接 hurt 等于"扣了个寂寞"。
+         * 所以每秒只做加法，攒够整数才真扣血。
+         *
+         * <p>只在服务端主线程读写（{@link #tick} 里），不需要并发容器；
+         * 进安全区 / 倒地 / 免伤 / 淘汰 / 换维度都会当场清掉这个键，不会带着零头爆伤。
+         */
+        private final Map<UUID, Float> accumulatedZoneDamage = new HashMap<>();
+
+        /**
+         * [r148] 小数池封顶下限（防"攒一堆突然爆伤"）：实际上限取
+         * {@code max(4, 本玩家本秒伤害 × 2)}——正常配置最多攒 4 点血，
+         * 即使玩家被别的免伤规则挡住一整轮，恢复可伤害那一刻也炸不出超过 4 点的瞬间掉血。
+         */
+        private static final float ACCUMULATOR_FLOOR_CAP = 4.0f;
+
         /** 阶段零初始蓝圈半径系数：罩住全图（圆心到最远角）所需半径的 2 倍起步。 */
         private static final double PHASE0_BLUE_FACTOR = 2.0;
 
@@ -260,6 +307,10 @@ public final class ZoneManager {
 
         /** 阶段表：地图 JSON 配了就用（夹硬限制），没配用按选区缩放的默认表。 */
         private static List<ZoneStage> resolveStages(GameMap map, double maxRadius) {
+            // [r148 TTK 模型] 地图级圈外淘汰秒数（double，默认 250）：
+            // 阶段自己填了 >0 的值以阶段为准，填 0 一律回落到这个全局值。
+            final double globalTtk = Math.max(GameMap.MIN_ZONE_TTK_SECONDS,
+                    Math.min(GameMap.MAX_ZONE_TTK_SECONDS, map.zoneTtkSeconds));
             List<ZonePhaseConfig> configs = map.zonePhases;
             if (configs == null || configs.isEmpty()) {
                 return ZoneStages.defaultsFor(maxRadius);
@@ -280,7 +331,7 @@ public final class ZoneManager {
                 } else {
                     ZonePhaseConfig safe = config.copy();
                     safe.clampIntoRange(maxRadius);
-                    stage = safe.toStage(i);   // 展示名用原始配置下标，和 JSON 一一对应
+                    stage = safe.toStage(i, globalTtk);   // 展示名用原始配置下标，和 JSON 一一对应
                 }
                 stages.add(stage);
                 if (i > 0) {
@@ -288,15 +339,19 @@ public final class ZoneManager {
                 }
                 table.append("config[").append(i).append("] 半径=").append((int) stage.targetRadius())
                         .append(" 等待=").append(stage.waitSeconds())
-                        .append(" 缩圈=").append(stage.shrinkSeconds());
+                        .append(" 缩圈=").append(stage.shrinkSeconds())
+                        .append(" 圈外淘汰=").append(formatSeconds(stage.zoneTtkSeconds())).append("秒")
+                        .append(config == null || config.zoneTtkSeconds <= 0.0 ? "（跟随全局）" : "");
             }
             if (stages.isEmpty()) {
                 return ZoneStages.defaultsFor(maxRadius);
             }
-            BattleRoyaleMod.LOGGER.info("[BR-ZONE] 地图 {} 阶段表（{} 项，按 config 下标原位对齐）：{}",
-                    map.mapId, stages.size(), table);
+            BattleRoyaleMod.LOGGER.info("[BR-ZONE] 地图 {} 阶段表（{} 项，按 config 下标原位对齐，全局圈外淘汰 {} 秒）：{}",
+                    map.mapId, stages.size(), formatSeconds(globalTtk), table);
             return stages;
         }
+
+        /** [r148] 秒数文案已上提到外层 ZoneManager.formatSeconds（GUI / 播报跨类共用）。 */
 
         // ----------------------------------------------------------------
         // 查询
@@ -484,51 +539,130 @@ public final class ZoneManager {
         // 圈外伤害：每 20 tick 一次；模块六——先校验维度，再打
         // ----------------------------------------------------------------
 
+        /**
+         * [r148] 本圈当前生效的「圈外淘汰时间」（秒，double）：
+         * 阶段值 &gt; 0 用阶段值；否则回落到地图全局 {@code GameMap.zoneTtkSeconds}。
+         * 倒地玩家的掉血曲线（{@code game.DownedManager}）读的是同一个口径。
+         */
+        public double zoneTtkSeconds() {
+            ZoneStage stage = currentStage();
+            if (stage != null && stage.zoneTtkSeconds() > 0.0) {
+                return stage.zoneTtkSeconds();
+            }
+            return map == null ? GameMap.DEFAULT_ZONE_TTK_SECONDS
+                    : Math.max(GameMap.MIN_ZONE_TTK_SECONDS, map.zoneTtkSeconds);
+        }
+
+        /** 清掉本圈所有玩家的伤害小数池（毒圈关闭 / 换局时调用）。 */
+        void clearZoneDamagePools() {
+            accumulatedZoneDamage.clear();
+        }
+
+        /**
+         * [r148 TTK 伤害累加器] 每 20 tick（= 1 秒）结算一次圈外伤害。
+         *
+         * <p>每秒伤害是<b>反推</b>出来的：{@code damagePerSecond = 玩家最大生命值 / 当前阶段
+         * 淘汰秒数}（例：第 1 阶段 20 / 250 = 0.08 点/秒，终局 20 / 8 = 2.5 点/秒；
+         * 有额外血量上限的玩家按 {@code getMaxHealth()} 实际值算）。结算严格按"加法进池、
+         * 攒满 1 点才扣"走：
+         * <ol>
+         *   <li>圈外 → {@code pool += damagePerSecond}（0.08、2.5 这样的小数先进池，不直接 hurt）；</li>
+         *   <li>{@code pool >= 1.0} → {@code damageToDeal = (int) pool} 真扣血（向下取整），
+         *       {@code pool -= damageToDeal} 把零头留给下一秒；</li>
+         *   <li>进安全区 / 倒地 / 免伤 / 旁观创造 / 换维度 / 离场 → 池子当场清零，
+         *       杜绝"边缘反复横跳攒出一大坨突然爆伤"。</li>
+         * </ol>
+         *
+         * <p>扣血走 {@link com.paimeng.battleroyale.game#ZoneDamage} 的自定义伤害类型
+         * {@code battleroyale:zone_damage}：绕过护甲、绕过受击无敌帧、无视抗性效果，
+         * 所以 1 点就是 1 点，不会被盔甲或"刚被打过"吞掉。玩家因此死亡时
+         * {@code ALLOW_DEATH → DownedManager.handleDeath} 照常触发（伤害源没有攻击者实体，
+         * 判定为环境致死：有队友→击倒，无队友→淘汰，播报走"在安全区外停留太久"口径）。
+         */
         private void applyZoneDamage(MinecraftServer server) {
             if (server == null) {
                 return;
             }
-            ZoneStage stage = currentStage();
-            float damage = stage == null ? 0.0f : stage.damagePerSecond();
-            if (damage <= 0.0f) {
+            double ttk = zoneTtkSeconds();
+            if (!(ttk > 0.0)) {
+                accumulatedZoneDamage.clear();   // 本圈不打伤害：池子清空，别把零头带进下一阶段
                 return;
             }
+            final Set<UUID> inScope = new HashSet<>();
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 // ---- 模块六硬规则：维度不同的玩家（主城 / 下界 / 别的地图）直接跳过 ----
                 if (player.level().dimension() != dimension) {
                     continue;
                 }
-                // 本局名单外的（管理员进维度配物资等）不吃毒圈伤害。
+                UUID id = player.getUUID();
+                // 本局名单外的（管理员进维度配物资等）不吃毒圈伤害，也不进池。
                 if (!GameManager.INSTANCE.isJoined(player.getGameProfile().getName())) {
                     continue;
                 }
-                if (!player.isAlive() || player.isSpectator() || player.isCreative()) {
-                    continue;   // 旁观/创造不参与毒圈
-                }
-                // 倒地玩家的血量由 DownedManager 按曲线统一控制（它自己会查维度），毒圈不叠加。
-                if (DownedManager.INSTANCE.isDowned(player.getUUID())) {
+                inScope.add(id);
+                if (!shouldSettleZoneDamage(player, id)) {
+                    accumulatedZoneDamage.remove(id);   // 不该吃毒的状态：零头当场作废
                     continue;
                 }
                 if (!isOutside(player.getX(), player.getZ())) {
+                    accumulatedZoneDamage.remove(id);   // 需求：进安全区直接清零
                     continue;
                 }
-                // 1.18.2 里伤害源是 DamageSource 类上的静态常量。
-                // [UPGRADE] 1.19+ 改为 server.getDamageSources().magic()；
-                //           1.20.1+ 改为 player.hurt(server.getDamageSources()
-                //                     .create(DamageTypes.MAGIC), damage)。其余逻辑不动。
-                // 毒圈伤害不应造成击退、受击抖动或无敌帧；先清理相关状态，伤害后再次清理。
-                player.setDeltaMovement(0.0, player.getDeltaMovement().y, 0.0);
-                player.hasImpulse = false;
-                player.hurtTime = 0;
-                // [1.20-PORT] maxHurtTime 原版改为不可直接写：player.maxHurtTime = 0;
-                player.invulnerableTime = 0;
-                player.hurt(player.damageSources().magic(), damage);
-                player.setDeltaMovement(0.0, player.getDeltaMovement().y, 0.0);
-                player.hasImpulse = false;
-                player.hurtTime = 0;
-                // [1.20-PORT] maxHurtTime 原版改为不可直接写：player.maxHurtTime = 0;
-                player.invulnerableTime = 0;
+                // [r148 反向推导] 每人每秒应加的伤害：实际上限血量 / 本阶段淘汰秒数。
+                float step = (float) (player.getMaxHealth() / ttk);
+                if (!(step > 0.0f)) {
+                    accumulatedZoneDamage.remove(id);
+                    continue;
+                }
+                // 小数池封顶：本步伤害的两倍与 4 点取大，横跳 / 长期免伤都炸不出爆伤。
+                float poolCap = Math.max(ACCUMULATOR_FLOOR_CAP, step * 2.0f);
+                float pool = accumulatedZoneDamage.getOrDefault(id, 0.0f) + step;
+                if (pool > poolCap) {
+                    pool = poolCap;
+                }
+                int damageToDeal = (int) pool;
+                if (damageToDeal <= 0) {
+                    accumulatedZoneDamage.put(id, pool);   // 还没攒满 1 点：只进池，不打伤害
+                    continue;
+                }
+                accumulatedZoneDamage.put(id, pool - damageToDeal);
+                // 毒圈伤害不该造成击退与受击抖动：伤害前后各清一次相关状态。
+                clearKnockbackAndFrames(player);
+                boolean applied = player.hurt(ZoneDamage.source(player), damageToDeal);
+                clearKnockbackAndFrames(player);
+                if (!applied) {
+                    // 被别的免伤规则挡下了（热身无敌 / 航线无敌 / 击倒独立血量池等）：
+                    // 这整数点退回池子，等能扣血的那一秒一起结，绝不"白扣"也绝不翻倍累积。
+                    float refunded = Math.min(poolCap, accumulatedZoneDamage.getOrDefault(id, 0.0f)
+                            + damageToDeal);
+                    accumulatedZoneDamage.put(id, refunded);
+                }
             }
+            // 断线 / 传走 / 淘汰出本维度的玩家：池子条目随手清掉，不积累垃圾键。
+            accumulatedZoneDamage.keySet().retainAll(inScope);
+        }
+
+        /**
+         * 这名玩家此刻该不该结算毒圈伤害：存活、非旁观非创造、没倒地、没在无敌名单里。
+         * 倒地玩家的掉血由 {@code DownedManager} 按独立血量池统一控制（不叠加、不吃无敌帧）。
+         */
+        private boolean shouldSettleZoneDamage(ServerPlayer player, UUID id) {
+            if (!player.isAlive() || player.isSpectator() || player.isCreative()) {
+                return false;
+            }
+            if (DownedManager.INSTANCE.isDowned(id)) {
+                return false;
+            }
+            return !WarmupManager.INSTANCE.isInvincible(id) && !FlightManager.INSTANCE.isInvincible(id);
+        }
+
+        /** 清掉击退 / 受击抖动 / 无敌帧残留（伤害源本身已绕过无敌帧，这里只处理手感）。 */
+        private static void clearKnockbackAndFrames(ServerPlayer player) {
+            player.setDeltaMovement(0.0, player.getDeltaMovement().y, 0.0);
+            player.hasImpulse = false;
+            player.hurtTime = 0;
+            // [1.20-PORT] maxHurtTime 原版改为不可直接写：player.maxHurtTime = 0;
+            player.invulnerableTime = 0;
         }
 
         // ----------------------------------------------------------------
@@ -540,10 +674,16 @@ public final class ZoneManager {
             // DONE（全部阶段收完）在 HUD 语义上等于「推进到底」：进度按 1.0 上报，
             // 客户端的 | 停在最右，不会在收圈后跳回最左。
             double progress = phase == ZonePhase.DONE ? 1.0 : shrinkProgress();
+            // [BR-ZONE-HUD 模块四] 阶段零（第一次收缩前）全图免伤，TTK 按 0 上报，
+            // 客户端的"圈外淘汰倒计时"在真正开始掉血前不会出现。
+            double ttk = phaseZero ? 0.0 : zoneTtkSeconds();
             return new ZoneSnapshot(phase, stageIndex, mapId, dimensionValue,
                     blueX, blueZ, blueRadius,
                     whiteX, whiteZ, whiteRadius,
-                    remainingSeconds(), progress);
+                    remainingSeconds(), progress, ttk,
+                    // [r198] damagePerSecond 按"该玩家血量 / TTK"逐人算，占位 0，
+                    // 由 network.ZoneSync.sendTo 在发包前 withDamagePerSecond 注入。
+                    0.0);
         }
 
         private void publish(MinecraftServer server) {

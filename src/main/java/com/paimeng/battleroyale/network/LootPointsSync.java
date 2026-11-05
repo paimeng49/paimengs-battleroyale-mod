@@ -61,6 +61,7 @@ public final class LootPointsSync {
         for (int i = 0; i < count; i++) {
             LootPoint point = points.get(i);
             buf.writeDouble(point.x);
+            buf.writeInt(point.y);
             buf.writeDouble(point.z);
             buf.writeUtf(point.name == null ? "物资点" : point.name, 64);
             buf.writeVarInt(Math.max(1, point.fontSize));
@@ -74,10 +75,11 @@ public final class LootPointsSync {
         List<LootPoint> points = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             double x = buf.readDouble();
+            int y = buf.readInt();
             double z = buf.readDouble();
             String name = buf.readUtf(64);
             int fontSize = Math.max(1, buf.readVarInt());
-            points.add(new LootPoint(x, z, name, fontSize));
+            points.add(new LootPoint(x, y, z, name, fontSize));
         }
         return new Payload(mapId, points);
     }

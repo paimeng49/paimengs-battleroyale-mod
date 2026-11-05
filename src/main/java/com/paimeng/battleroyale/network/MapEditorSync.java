@@ -29,7 +29,8 @@ public final class MapEditorSync {
     public static final ResourceLocation LINK_ARCHIVE_CHANNEL = id("map_editor_link_archive");
     /**
      * r109 模块一：毒圈阶段配置保存（C2S）。GUI 详情面板编辑完
-     * {@code waitTime / shrinkTime / radius / damage} 后整表发回，
+     * {@code waitTime / shrinkTime / radius / zoneTtkSeconds} 后整表发回，
+     * 包尾再带一个 double（地图级每秒毒圈伤害，[r147 累加器]），
      * 服务端按该地图选区做半径硬限制、夹合法后写进地图 JSON。
      */
     public static final ResourceLocation ZONE_SAVE_CHANNEL = id("map_editor_zone_save");
@@ -132,14 +133,29 @@ public final class MapEditorSync {
                         return;
                     }
                     if (detailUpdate) {
-                        // 详情面板保存：只把「显示名称 / 源存档 / 物资点名称字号」合并进服务端真实对象，
-                        // 选区、出生点、上限人数等一律取真实对象的原值，绝不用客户端那份可能不完整的副本覆盖。
+                        // 详情面板保存：把「显示名称 / 源存档 / 飞机速度 / 队伍上限 / 圈外淘汰秒数 /
+                        // 物资池配置（lootPool、airdropLootPool、maxLootBoxes、maxAirdrops、airdropStages）/
+                        // 物资点名称字号」合并进服务端真实对象；
+                        // 选区、出生点等一律取真实对象的原值，绝不用客户端那份可能不完整的副本覆盖。
                         saveDetailConfiguration(player, map, lootListComplete);
                         return;
                     }
                     SelectionData s = MapEditSession.selectionOf(player.getUUID());
                     if (s.isComplete()) { map.minX=s.minX(); map.maxX=s.maxX(); map.minZ=s.minZ(); map.maxZ=s.maxZ(); }
                     if (map.sourceArchivePath == null || map.sourceArchivePath.isBlank()) map.sourceArchivePath=s.archivePath;
+                    // 手动物资箱坐标只保存在服务端草稿中，不经过地图编辑器载荷往返。
+                    // 保存同一张地图时以服务端草稿为准；否则保留已有地图的坐标，防止 GUI 保存清空标记。
+                    if (editingSame && draft.manualLootSpawns != null && !draft.manualLootSpawns.isEmpty()) {
+                        map.manualLootSpawns = new ArrayList<>();
+                        for (com.paimeng.battleroyale.map.ManualLootSpawn spawn : draft.manualLootSpawns) {
+                            if (spawn != null) {
+                                map.manualLootSpawns.add(new com.paimeng.battleroyale.map.ManualLootSpawn(spawn.x, spawn.y, spawn.z));
+                            }
+                        }
+                    } else if (map.manualLootSpawns == null || map.manualLootSpawns.isEmpty()) {
+                        map.manualLootSpawns = existing == null || existing.manualLootSpawns == null
+                                ? new ArrayList<>() : new ArrayList<>(existing.manualLootSpawns);
+                    }
                     // 「草稿保存」通道的兜底：草稿是空壳（没从 JSON 装载过物资点 / 源存档）时，
                     // 绝不允许把已有地图的物资点和源存档路径抹掉——这正是物资点被清零的另一条路径。
                     if (existing != null) {
@@ -156,10 +172,25 @@ public final class MapEditorSync {
                         if (map.sourceArchivePath == null || map.sourceArchivePath.isBlank()) {
                             map.sourceArchivePath = existing.sourceArchivePath == null ? "" : existing.sourceArchivePath;
                         }
-                        // 草稿没带的运营参数（人数上限 / 房间数 / 队伍上限）沿用原值，避免被默认值覆盖。
-                        map.maxPlayers = map.maxPlayers <= 0 ? existing.maxPlayers : map.maxPlayers;
+                        // 草稿没带的运营参数（房间数 / 大厅队上限）沿用原值，避免被默认值覆盖。
+                        // [r149 DYNCAP 模块一] maxPlayers 写死字段已删除；决定动态人数上限的
+                        // maxTeams / maxTeamSize 在草稿通道不是编辑对象（它们在「地图详情面板」
+                        // 通道单独合并），这里一律以服务端原值为准——防止空壳草稿用默认 25×4
+                        // 悄悄改掉管理员配好的容量。
+                        map.maxTeams = existing.maxTeams;
+                        map.maxTeamSize = existing.maxTeamSize;
                         map.maxRooms = map.maxRooms <= 0 ? existing.maxRooms : map.maxRooms;
                         map.teamLimit = map.teamLimit <= 0 ? existing.teamLimit : map.teamLimit;
+                        // [BR-LOOT-SAVE-FIX] 物资刷新配置在「草稿（编辑副本）」面板里根本没有输入框，
+                        // 它只在「地图详情面板」通道被编辑。草稿包里的这五个字段可能是旧客户端 /
+                        // 列表副本带来的空壳值，直接落盘就会把管理员配好的物资池抹掉。
+                        // 所以草稿通道一律以服务端原值为准——和 maxTeams / maxTeamSize 同一口径。
+                        map.lootPool = existing.lootPool == null ? "" : existing.lootPool;
+                        map.airdropLootPool = existing.airdropLootPool == null ? "" : existing.airdropLootPool;
+                        map.maxLootBoxes = existing.maxLootBoxes;
+                        map.maxAirdrops = existing.maxAirdrops;
+                        map.airdropStages = existing.airdropStages == null
+                                ? new ArrayList<>() : new ArrayList<>(existing.airdropStages);
                     }
                     if (map.sourceArchivePath == null || map.sourceArchivePath.isBlank()) {
                         BattleRoyaleMod.LOGGER.warn("保存地图 {} 时 sourceArchivePath 仍为空：游戏维度将无法复制区块。"
@@ -196,19 +227,24 @@ public final class MapEditorSync {
         ServerPlayNetworking.registerGlobalReceiver(ZONE_SAVE_CHANNEL, (server, player, handler, buf, response) -> {
             String mapId;
             List<com.paimeng.battleroyale.map.ZonePhaseConfig> phases;
+            double globalTtk;
             try {
                 mapId = buf.readUtf(64);
                 phases = MapEditorSyncPayload.readZonePhases(buf);
+                // [r148 TTK 模型] 尾巴多带一个 double：地图级圈外淘汰秒数（支持小数）。
+                // 读写两端在同一个 jar 里，缺字段只会是伪造包 → 按哨兵 -1 处理（保留服务端现值）。
+                globalTtk = buf.readDouble();
             } catch (RuntimeException e) {
                 return;
             }
             final String targetMapId = mapId;
             final List<com.paimeng.battleroyale.map.ZonePhaseConfig> incoming = phases;
+            final double incomingGlobalTtk = globalTtk;
             server.execute(() -> {
                 if (!player.createCommandSourceStack().hasPermission(2)) {
                     return;
                 }
-                saveZonePhases(player, targetMapId, incoming);
+                saveZonePhases(player, targetMapId, incoming, incomingGlobalTtk);
             });
         });
         ServerPlayNetworking.registerGlobalReceiver(REFRESH_CHANNEL, (server, player, handler, buf, response) -> server.execute(() -> {
@@ -329,21 +365,63 @@ public final class MapEditorSync {
         // [BR-MATCHTEAM] maxTeams / maxTeamSize：解码时已 normalizeMatchLimits 治理过（2~25 / 1~4），直接合并。
         real.maxTeams = incoming.maxTeams;
         real.maxTeamSize = incoming.maxTeamSize;
+        // [r148 TTK 模型] 地图级圈外淘汰秒数：解码时已 normalizeZoneTtk 治理过（1~3600 秒）。
+        real.zoneTtkSeconds = incoming.zoneTtkSeconds;
+        // [BR-LOOT 模块一] 物资池配置：解码时已过 normalizeLootConfiguration 治理闸，直接合并。
+        real.lootPool = incoming.lootPool == null ? "" : incoming.lootPool;
+        real.airdropLootPool = incoming.airdropLootPool == null ? "" : incoming.airdropLootPool;
+        real.maxLootBoxes = incoming.maxLootBoxes;
+        real.maxAirdrops = incoming.maxAirdrops;
+        real.airdropStages = incoming.airdropStages == null
+                ? new java.util.ArrayList<>() : new java.util.ArrayList<>(incoming.airdropStages);
+        // [BR-LOOT-SAVE-FIX] 合并完立刻把「收到了什么 / 合并后是什么 / 解析得出几组」打进日志：
+        // 之前管理员反馈「前端填了根本没存进去」，光看 JSON 分不清是包没带到、白名单没合并、
+        // 还是解析器把配置判成非法，这里一次说清。
+        BattleRoyaleMod.LOGGER.info("[BR-LOOT-SAVE] 详情面板合并物资配置 mapId={}：lootPool 收到 {} 字符（合并后 {} 字符），"
+                        + "airdropLootPool 收到 {} 字符，maxLootBoxes={}，maxAirdrops={}，airdropStages={}；"
+                        + "本地图 lootPool 现可解析出 {} 个物资组",
+                real.mapId, lengthOf(incoming.lootPool), lengthOf(real.lootPool),
+                lengthOf(incoming.airdropLootPool), real.maxLootBoxes, real.maxAirdrops,
+                real.airdropStages, com.paimeng.battleroyale.game.LootPoolParser
+                        .parse(real.lootPool, "BR-LOOT-SAVE", real.mapId).size());
+        if (real.lootPool.isEmpty()) {
+            // 客户端送来空串：要么是管理员真的清空了，要么就是包里没带字段（旧客户端 / 列表包缺字段）。
+            // 空串落盘等于「这局改用内置默认池」，必须显眼地记一条，别再让人猜。
+            BattleRoyaleMod.LOGGER.warn("[BR-LOOT-SAVE] 详情面板送来的 lootPool 是空串（mapId={}），"
+                    + "本局将回退内置默认物资池；原始配置字符串：[{}]", real.mapId, incoming.lootPool);
+        }
         int changed = applyDetailLootPoints(real, incoming.lootPoints, lootListComplete);
         MapManager.INSTANCE.saveMap(real);
         MapEditSession.DRAFTS.put(player.getUUID(), real.copy());
         LootPointsSync.broadcastToDimension(player.getServer(), real);
         int total = real.lootPoints == null ? 0 : real.lootPoints.size();
         boolean linked = real.sourceArchivePath != null && !real.sourceArchivePath.isBlank();
+        // [BR-LOOT-SAVE-FIX] 回执里带上物资池解析结果：管理员在聊天框就能看到「存进去几组」，
+        // 不用再靠开一局去反推配置到底有没有落盘。
+        int lootGroups = com.paimeng.battleroyale.game.LootPoolParser
+                .parse(real.lootPool, "BR-LOOT-SAVE", real.mapId).size();
+        int airdropGroups = com.paimeng.battleroyale.game.LootPoolParser
+                .parse(real.airdropLootPool, "BR-AIRDROP-SAVE", real.mapId).size();
         player.displayClientMessage(com.paimeng.battleroyale.util.BrText.of("地图 " + real.mapId + " 配置已保存：显示名 "
                 + real.displayName + "，飞机速度 " + real.flightSpeed + " 格/tick，物资点 " + total
                 + " 个（本次改动 " + changed + " 个）"
                 + (linked ? "，已关联源存档" : "，源存档仍未关联")), false);
+        player.displayClientMessage(com.paimeng.battleroyale.util.BrText.of(
+                "物资刷新配置已写入 JSON：本局刷 " + real.maxLootBoxes + " 箱上限、空投 " + real.maxAirdrops
+                        + " 次（第 " + real.airdropStages + " 阶段），"
+                        + "地图物资池解析出 " + (real.lootPool.isEmpty() ? "0（空配置，本局用内置默认池）" : lootGroups)
+                        + " 组，空投池解析出 " + (real.airdropLootPool.isEmpty() ? "0（空配置，用内置默认池）" : airdropGroups)
+                        + " 组"), false);
         BattleRoyaleMod.LOGGER.info("详情面板保存地图 {}：显示名={}，源存档={}，飞机速度={} 格/tick，物资点 {} 个（本次改动 {} 个），"
                         + "选区保持 X {}~{}，Z {}~{}",
                 real.mapId, real.displayName, real.sourceArchivePath, real.flightSpeed, total, changed,
                 real.minX, real.maxX, real.minZ, real.maxZ);
         MapListSync.send(player);
+    }
+
+    /** 日志用：null 安全地报出字符串长度（配置是否真送到服务端，看长度最快）。 */
+    private static int lengthOf(String s) {
+        return s == null ? -1 : s.length();
     }
 
     /**
@@ -422,7 +500,8 @@ public final class MapEditorSync {
      * 空列表是合法输入（= 清空自定义，运行时用按选区缩放的默认表）。
      */
     private static void saveZonePhases(ServerPlayer player, String mapId,
-                                       List<com.paimeng.battleroyale.map.ZonePhaseConfig> incoming) {
+                                       List<com.paimeng.battleroyale.map.ZonePhaseConfig> incoming,
+                                       double incomingGlobalTtk) {
         if (mapId == null || !mapId.matches("[A-Za-z0-9_-]+")) {
             player.displayClientMessage(com.paimeng.battleroyale.util.BrText.of(
                     "毒圈保存被拒：地图 ID 不合法（" + mapId + "）"), false);
@@ -455,18 +534,29 @@ public final class MapEditorSync {
             int beforeWait = phase.waitTime;
             int beforeShrink = phase.shrinkTime;
             double beforeRadius = phase.radius;
-            double beforeDamage = phase.damage;
+            double beforeTtk = phase.zoneTtkSeconds;
             phase.clampIntoRange(maxRadius);
             if (beforeWait != phase.waitTime || beforeShrink != phase.shrinkTime
-                    || beforeRadius != phase.radius || beforeDamage != phase.damage) {
+                    || beforeRadius != phase.radius || beforeTtk != phase.zoneTtkSeconds) {
                 clamped++;
             }
             cleaned.add(phase);
         }
         real.zonePhases = cleaned;
+        // [r148 TTK 模型] 地图级圈外淘汰秒数：坏值（NaN / 负 / 越界）先治理再落盘。
+        boolean ttkChanged = false;
+        if (Double.isFinite(incomingGlobalTtk) && incomingGlobalTtk >= 0.0) {
+            double before = real.zoneTtkSeconds;
+            real.zoneTtkSeconds = incomingGlobalTtk;
+            real.normalizeZoneTtk();
+            ttkChanged = before != real.zoneTtkSeconds;
+        }
         MapManager.INSTANCE.saveMap(real);
         player.displayClientMessage(com.paimeng.battleroyale.util.BrText.of(
-                "毒圈配置已保存：" + real.mapId + " 共 " + cleaned.size() + " 个阶段"
+                "毒圈配置已保存：" + real.mapId + " 共 " + cleaned.size() + " 个阶段，圈外满血淘汰时间 "
+                        + com.paimeng.battleroyale.zone.ZoneManager.formatSeconds(real.zoneTtkSeconds) + " 秒"
+                        + (ttkChanged ? "（已夹到合法范围，1 ~ "
+                            + (int) GameMap.MAX_ZONE_TTK_SECONDS + " 秒）" : "")
                         + (holes > 0 ? "（补正 " + holes + " 个空位，阶段序号不会前移）" : "")
                         + (clamped > 0 ? "（其中 " + clamped + " 个阶段被夹到合法范围，半径上限 "
                         + (int) Math.floor(maxRadius) + " 米）" : "（半径上限 " + (int) Math.floor(maxRadius) + " 米）")), false);
@@ -545,10 +635,13 @@ public final class MapEditorSync {
     }
 
     /** r109 模块一：详情面板「保存毒圈」——整表 C2S 发给服务端校验并落盘（回执走地图列表回推）。 */
-    public static void saveZonePhases(String mapId, List<com.paimeng.battleroyale.map.ZonePhaseConfig> phases) {
+    public static void saveZonePhases(String mapId, List<com.paimeng.battleroyale.map.ZonePhaseConfig> phases,
+                                      double zoneTtkSeconds) {
         var b = PacketByteBufs.create();
         b.writeUtf(mapId == null ? "" : mapId, 64);
         MapEditorSyncPayload.writeZonePhases(b, phases);
+        // [r148 TTK 模型] 地图级圈外淘汰秒数（double，支持小数）跟阶段表一起提交。
+        b.writeDouble(zoneTtkSeconds);
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(ZONE_SAVE_CHANNEL, b);
     }
 }

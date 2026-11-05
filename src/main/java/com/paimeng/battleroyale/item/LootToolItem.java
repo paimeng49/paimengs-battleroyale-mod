@@ -16,8 +16,9 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.Component;
 import net.minecraft.ChatFormatting;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 
@@ -26,7 +27,7 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** 左键在当前编辑地图上添加物资点。 */
+/** 物资点工具：右键添加，左键移除最近点。 */
 public final class LootToolItem extends Item {
     private static final Pattern NUMBERED = Pattern.compile("^物资点(\\d+)$");
 
@@ -35,16 +36,30 @@ public final class LootToolItem extends Item {
     }
 
     @Override
+    public InteractionResult useOn(UseOnContext context) {
+        Player player = context.getPlayer();
+        Level world = context.getLevel();
+        if (player == null || world.isClientSide()) {
+            return InteractionResult.SUCCESS;
+        }
+        if (player instanceof ServerPlayer serverPlayer) {
+            addLoot(serverPlayer, world, context.getClickedPos());
+        }
+        return InteractionResult.SUCCESS;
+    }
+
+    @Override
     public boolean canAttackBlock(BlockState state, Level world, BlockPos pos, Player miner) {
         if (!world.isClientSide() && miner instanceof ServerPlayer player) {
-            addLoot(player, world, pos);
+            removeLoot(player, world, pos);
         }
         return false;
     }
 
     @Override
     public void appendHoverText(ItemStack stack, Level world, List<Component> tooltip, TooltipFlag context) {
-        tooltip.add(Component.literal("左键点击方块：在此位置添加物资点").withStyle(ChatFormatting.GRAY));
+        tooltip.add(Component.literal("右键点击方块：添加手动物资点").withStyle(ChatFormatting.GRAY));
+        tooltip.add(Component.literal("左键点击方块：移除附近物资点").withStyle(ChatFormatting.GRAY));
     }
 
     private static void addLoot(ServerPlayer player, Level world, BlockPos pos) {
@@ -73,6 +88,7 @@ public final class LootToolItem extends Item {
             map.lootPoints = new ArrayList<>();
         }
         double x = pos.getX();
+        int y = pos.getY() + 1;
         double z = pos.getZ();
         for (LootPoint existing : map.lootPoints) {
             double dx = existing.x() - x;
@@ -83,14 +99,49 @@ public final class LootToolItem extends Item {
             }
         }
         String name = nextName(map.lootPoints);
-        map.lootPoints.add(new LootPoint(x, z, name, 12));
+        map.lootPoints.add(new LootPoint(x, y, z, name, 12));
         if (draft) {
             MapEditorSync.sendOpen(player, map);
         } else {
             MapManager.INSTANCE.saveMap(map);
             LootPointsSync.sendTo(player, map);
         }
-        player.displayClientMessage(BrText.of("已添加物资点 " + name + "：(" + (int) x + ", " + (int) z + ")，可在 GUI 里修改名称"), false);
+        player.displayClientMessage(BrText.of("已添加手动物资点（当前共 " + map.lootPoints.size() + " 个）"), false);
+    }
+
+    private static void removeLoot(ServerPlayer player, Level world, BlockPos pos) {
+        boolean draft = EditWorldManager.isEditWorld(world.dimension());
+        GameMap map = draft ? MapEditSession.draftOf(player.getUUID())
+                : GameWorldManager.mapForWorld(world.dimension());
+        if (map == null || map.lootPoints == null || map.lootPoints.isEmpty()) {
+            player.displayClientMessage(BrText.of("附近没有可移除的手动物资点"), false);
+            return;
+        }
+        int best = -1;
+        double bestDistance = 4.0D;
+        for (int i = 0; i < map.lootPoints.size(); i++) {
+            LootPoint point = map.lootPoints.get(i);
+            double dx = point.x() - pos.getX();
+            double dy = (point.y() < 0 ? pos.getY() + 1 : point.y()) - (pos.getY() + 1);
+            double dz = point.z() - pos.getZ();
+            double distance = dx * dx + dy * dy + dz * dz;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        if (best < 0) {
+            player.displayClientMessage(BrText.of("附近没有可移除的手动物资点"), false);
+            return;
+        }
+        map.lootPoints.remove(best);
+        if (draft) {
+            MapEditorSync.sendOpen(player, map);
+        } else {
+            MapManager.INSTANCE.saveMap(map);
+            LootPointsSync.sendTo(player, map);
+        }
+        player.displayClientMessage(BrText.of("已移除最近的手动物资点（当前共 " + map.lootPoints.size() + " 个）"), false);
     }
 
     private static String nextName(List<LootPoint> points) {

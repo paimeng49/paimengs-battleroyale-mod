@@ -416,7 +416,8 @@ public final class EditWorldManager {
     private static void giveTools(ServerPlayer player) {
         giveIfMissing(player, new ItemStack(ModItems.SELECTION_TOOL));
         giveIfMissing(player, new ItemStack(ModItems.LOOT_TOOL));
-        player.displayClientMessage(BrText.of("已发放选区工具和物资点工具"), false);
+        giveIfMissing(player, new ItemStack(ModItems.CHEST_SPAWN_TOOL));
+        player.displayClientMessage(BrText.of("已发放选区工具、物资点工具和物资箱工具"), false);
     }
 
     private static void giveIfMissing(ServerPlayer player, ItemStack stack) {

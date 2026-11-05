@@ -9,7 +9,10 @@ import com.paimeng.battleroyale.network.MapEditorSync;
 import com.paimeng.battleroyale.network.MapEditorSyncPayload;
 import com.paimeng.battleroyale.network.MapListSync;
 import com.paimeng.battleroyale.network.MapListSyncPayload;
+import com.paimeng.battleroyale.network.MatchRosterSync;
+import com.paimeng.battleroyale.network.TeammatePosSync;
 import com.paimeng.battleroyale.network.PingSync;
+import com.paimeng.battleroyale.network.ParachuteSync;
 import com.paimeng.battleroyale.network.StatsSync;
 import com.paimeng.battleroyale.network.TeamSync;
 import com.paimeng.battleroyale.network.ZoneSync;
@@ -24,6 +27,8 @@ import net.fabricmc.fabric.api.client.rendering.v1.LivingEntityFeatureRendererRe
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.renderer.entity.player.PlayerRenderer;
 import net.minecraft.world.entity.EntityType;
+import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+import com.paimeng.battleroyale.entity.ModEntities;
 
 @Environment(EnvType.CLIENT)
 public final class BattleRoyaleModClient implements ClientModInitializer {
@@ -32,18 +37,29 @@ public final class BattleRoyaleModClient implements ClientModInitializer {
         // [BR-MTR2] C-130 不再是实体：没有 EntityRendererRegistry，模型走
         // WorldRenderEvents.AFTER_ENTITIES 的数据驱动渲染（C130WorldRenderer）。
         ModKeyBindings.register();
+        EntityRendererRegistry.register(ModEntities.AIRDROP, AirdropEntityRenderer::new);
         // [BR-ROLLBACK] END：按键判定 + 机上镜像坐标锁定（防抽搐核心）。
         // START_CLIENT_TICK 钩子连同 r89 的 sneakKey 槽位操作一起删除——本模组
         // 全生命周期不再触碰原版任何按键的绑定与槽位。
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             MapThumbnailGenerator.onClientTick();
             ModKeyBindings.tick(client);
+            // [BR-PARA-CULL] 开伞玩家包围盒撑大/还原（躲视锥剔除）。
+            ClientParachuteState.tick(client);
             // [BR-ZONE] 模块六 3：本地维度保险——毒圈还挂着但世界已经切换
             // （被淘汰传送 / br leave 回大厅）就当场清空，不等服务端下一发 IDLE 包。
             ClientZoneState.expireIfNotIn(client.level == null ? null : client.level.dimension());
+            // 首次检测到圈外时提前建立毫秒锚点；计时期间不会再读取血量校正。
+            ZoneTtkCountdown.tick(client);
         });
         ClientPlayNetworking.registerGlobalReceiver(ZoneSync.CHANNEL_ID, (client, handler, buf, sender) -> ClientZoneState.apply(ZoneSync.decode(buf)));
         ClientPlayNetworking.registerGlobalReceiver(TeamSync.CHANNEL_ID, (client, handler, buf, sender) -> ClientTeamState.apply(TeamSync.decode(buf)));
+        // [BR-NAMETAG] 本局花名册（uuid→座号）：头顶 NameTag 拼 [N号] 的查表源。
+        ClientPlayNetworking.registerGlobalReceiver(MatchRosterSync.CHANNEL_ID,
+                (client, handler, buf, sender) -> ClientMatchRoster.apply(MatchRosterSync.decode(buf)));
+        // [BR-MINIMAP] 队友坐标快照（每 5 tick 定向同步，小地图 / 全屏地图图标源）。
+        ClientPlayNetworking.registerGlobalReceiver(TeammatePosSync.CHANNEL_ID,
+                (client, handler, buf, sender) -> ClientTeammatePosState.apply(TeammatePosSync.decode(buf)));
         ClientPlayNetworking.registerGlobalReceiver(StatsSync.CHANNEL_ID, (client, handler, buf, sender) -> ClientStatsState.apply(StatsSync.decode(buf)));
         ClientPlayNetworking.registerGlobalReceiver(DownedSync.CHANNEL_ID, (client, handler, buf, sender) -> {
             DownedSyncPayload payload = DownedSync.decode(buf);
@@ -112,12 +128,15 @@ public final class BattleRoyaleModClient implements ClientModInitializer {
         });
         // C2：小地图 Tile 缓存（S2C 接收 + 按需请求），本轮只存数据不参与渲染。
         ClientMapCache.registerClient();
+        // [BR-PARA-SYNC] 服务端按 UUID 广播开伞状态，所有玩家客户端都能独立渲染。
+        ParachuteSync.registerClient();
         // [BR-MTR2] C-130：数据驱动世界渲染（实体管线已整体删除）。
         WorldRenderEvents.AFTER_ENTITIES.register(C130WorldRenderer::render);
         WorldRenderEvents.AFTER_TRANSLUCENT.register(ZoneWallRenderer::render);
         WorldRenderEvents.AFTER_TRANSLUCENT.register(PingRenderer::render);
         HudRenderCallback.EVENT.register(StatsHudRenderer::render);
         HudRenderCallback.EVENT.register(DownedHudRenderer::render);
+        HudRenderCallback.EVENT.register(ZoneTtkHudRenderer::render);
         HudRenderCallback.EVENT.register(TeamHudRenderer::render);
         HudRenderCallback.EVENT.register(MapHudRenderer::render);
         // [BR-PARA] 跳伞降落伞：纯视觉，Fabric 原生 feature 注册回调。
@@ -137,11 +156,14 @@ public final class BattleRoyaleModClient implements ClientModInitializer {
             try {
                 ClientZoneState.clear();
                 ClientTeamState.clear();
+                ClientMatchRoster.clear();
+                ClientTeammatePosState.clear();
                 ClientStatsState.clear();
                 ClientDownedState.clear();
                 ClientPingState.clear();
                 ClientLootPointsState.clear();
                 ClientFlightState.clear();
+                ClientParachuteState.clear();
                 MapThumbnailGenerator.clear();
                 ClientMapCache.clear();
             } catch (Throwable t) {

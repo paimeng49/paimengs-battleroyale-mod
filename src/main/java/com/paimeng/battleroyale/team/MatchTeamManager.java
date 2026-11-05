@@ -3,14 +3,18 @@ package com.paimeng.battleroyale.team;
 import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.event.EventBus;
 import com.paimeng.battleroyale.event.MatchmakingCompleteEvent;
+import com.paimeng.battleroyale.event.PlayerEliminatedEvent;
 import com.paimeng.battleroyale.game.DownedManager;
 import com.paimeng.battleroyale.game.GameManager;
 import com.paimeng.battleroyale.map.GameMap;
 import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.map.MapManager;
 import com.paimeng.battleroyale.match.MapQueue;
+import com.paimeng.battleroyale.network.MatchRosterPayload;
+import com.paimeng.battleroyale.network.MatchRosterSync;
 import com.paimeng.battleroyale.network.TeamSync;
 import com.paimeng.battleroyale.network.TeamSyncPayload;
+import com.paimeng.battleroyale.network.TeammatePosSync;
 import com.paimeng.battleroyale.util.BrText;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.MutableComponent;
@@ -58,8 +62,30 @@ public final class MatchTeamManager {
     private final List<MatchTeam> teams = new ArrayList<>();
     private final Map<UUID, MatchTeam> playerToTeam = new LinkedHashMap<>();
 
+    /**
+     * [BR-TEAMHUD] 本局淘汰名册：被分到 MatchTeam 后在本局内被淘汰（含逃跑判定）的 UUID。
+     * 与 DownedManager 的即时状态区别开：那边在淘汰收尾的 clearPlayer 里会抹掉
+     * eliminated 标记（复活/回大厅场景复用同一出口），这份名册只随本局走
+     * （开局重建、销毁清空），是队伍 HUD 的 ELIMINATED 显示与掉线重连判定的权威依据。
+     */
+    private final Set<UUID> eliminatedThisMatch = new HashSet<>();
+
     /** [BR-MATCHTEAM 第三步] 开局失败闩：mapId → 失败当时等待队列的签名。 */
     private final Map<String, Long> startBlockedSignature = new HashMap<>();
+
+    /** [BR-NAMETAG] 花名册周期重播计数（服务端主线程独占）。 */
+    private int rosterTickCounter;
+
+    /** [BR-NAMETAG] 花名册重播间隔（tick）：10 秒一份，兜底晚进服 / 丢包，流量可忽略。 */
+    private static final int ROSTER_REBROADCAST_TICKS = 200;
+
+    /**
+     * [BR-WINGUARD] 本局开局时分发出去的 MatchTeam 总数。
+     * 胜负判定必须要求开局 >= 2 支队伍：单人测试只有 1 支队时，
+     * 「存活队伍数 <= 1」从第 1 tick 就恒成立，会在 RUNNING 刚切入的
+     * 下一个 tick 就把状态机静默推到 ENDED。
+     */
+    private int startedTeamCount;
 
     private MatchTeamManager() {
     }
@@ -173,6 +199,10 @@ public final class MatchTeamManager {
 
         active = assignedAny;
         if (assignedAny) {
+            startedTeamCount = teams.size();
+            // [BR-NAMETAG] 开局当场广播本局花名册（uuid→座号）：
+            // 客户端给头顶 NameTag 拼 [N号] 前缀必须拿得到全部队伍的座号表。
+            broadcastRoster(server);
             int players = playerToTeam.size();
             EventBus.INSTANCE.publish(new MatchmakingCompleteEvent(
                     teams.size(), players, teams.isEmpty() ? 1 : teams.get(0).size(),
@@ -197,7 +227,7 @@ public final class MatchTeamManager {
             }
             Team lobby = TeamManager.INSTANCE.teamOf(playerId);
             MatchTeamAllocator.Member member = new MatchTeamAllocator.Member(playerId,
-                    player.getGameProfile().getName(), lobbyNumberOf(lobby, playerId), isLobbyLeader(playerId));
+                    player.getGameProfile().getName(), lobbyOrderOf(lobby, playerId), isLobbyLeader(playerId));
             if (lobby == null) {
                 // 野排散人：1 人预组队，和大厅队走完全同一套桶逻辑。
                 premades.add(new MatchTeamAllocator.Premade(null, playerId, 0, member.name(), List.of(member)));
@@ -323,9 +353,107 @@ public final class MatchTeamManager {
         return List.copyOf(teams);
     }
 
-    /** 本局全部参赛玩家 UUID。 */
+    /** [BR-MATCHTEAM] 本局全部参赛玩家 UUID。 */
     public Set<UUID> assignedPlayerIds() {
         return Set.copyOf(playerToTeam.keySet());
+    }
+
+    /**
+     * [BR-TEAMHUD] 队友存活状态联动：该玩家所在 MatchTeam 的状态快照重发给全队。
+     * 由 DownedManager 在击倒 / 救起等瞬时状态切换、以及本局淘汰名册变化时调用；
+     * 未开局或该玩家不在局内队伍里则静默跳过（大厅快照不需要状态字段）。
+     */
+    public void resyncStatusFor(UUID playerId, MinecraftServer server) {
+        if (!active || playerId == null || server == null) {
+            return;
+        }
+        MatchTeam team = playerToTeam.get(playerId);
+        if (team != null) {
+            TeamSync.syncMatchTeam(team, server);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // [BR-NAMETAG] 本局花名册（uuid → 座号）：客户端给任何一名玩家
+    // 拼头顶 [N号] 前缀都要查这张表，所以必须全量下发，而不只自己那支队。
+    // ------------------------------------------------------------------
+
+    /** 组装并广播本局花名册；未开局 / 无队伍时静默跳过。 */
+    public void broadcastRoster(MinecraftServer server) {
+        if (!active || server == null || playerToTeam.isEmpty()) {
+            return;
+        }
+        List<MatchRosterPayload.Entry> entries = new ArrayList<>(playerToTeam.size());
+        for (Map.Entry<UUID, MatchTeam> entry : playerToTeam.entrySet()) {
+            entries.add(new MatchRosterPayload.Entry(entry.getKey(),
+                    entry.getValue().squadIndexOf(entry.getKey())));
+        }
+        MatchRosterSync.broadcast(server, new MatchRosterPayload(true, entries));
+    }
+
+    /** 广播空花名册：客户端清空座号表，头顶名字恢复原样（大厅阶段要求）。 */
+    public void broadcastEmptyRoster(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
+        MatchRosterSync.broadcast(server, MatchRosterPayload.empty());
+    }
+
+    /**
+     * 挂到 {@code ServerTickEvents.END_SERVER_TICK}：每 {@value #ROSTER_REBROADCAST_TICKS}
+     * tick 重播一份花名册，兜底中途重连进服 / 丢包的客户端。
+     */
+    public void tick(MinecraftServer server) {
+        if (!active || server == null) {
+            rosterTickCounter = 0;
+            return;
+        }
+        rosterTickCounter++;
+        if (rosterTickCounter % ROSTER_REBROADCAST_TICKS == 0) {
+            broadcastRoster(server);
+        }
+    }
+
+    /** [BR-TEAMHUD] 该玩家是否在本局内已被淘汰（含逃跑判定；DownedManager 的瞬时标记也算）。 */
+    public boolean wasEliminatedThisMatch(UUID playerId) {
+        return playerId != null
+                && (eliminatedThisMatch.contains(playerId) || DownedManager.INSTANCE.isEliminated(playerId));
+    }
+
+    /**
+     * [BR-TEAMHUD] PlayerEliminatedEvent 消费者：进本局淘汰名册并立刻重发该队快照，
+     * 全队 HUD 当场把这名成员画成灰色删除线（ELIMINATED）。
+     * 只记被分到 MatchTeam 的参赛者；未开局（分配失败回退 / 大厅死亡）不进名册。
+     */
+    public void onPlayerEliminated(PlayerEliminatedEvent event) {
+        if (!active || event == null || event.player() == null) {
+            return;
+        }
+        UUID playerId = event.player().getUUID();
+        if (!playerToTeam.containsKey(playerId)) {
+            return;
+        }
+        if (eliminatedThisMatch.add(playerId)) {
+            resyncStatusFor(playerId, event.server());
+        }
+    }
+
+    /**
+     * [BR-TEAMHUD] 成员在队伍 HUD 上的实时状态码：
+     * 0 = ALIVE、1 = DOWNED（倒地待救）、2 = ELIMINATED（本局淘汰，优先于倒地）。
+     * 数据权威取自 DownedManager（倒地）+ 本局淘汰名册（淘汰）。
+     */
+    public int matchStatusOf(UUID playerId) {
+        if (playerId == null) {
+            return com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_ALIVE;
+        }
+        if (wasEliminatedThisMatch(playerId)) {
+            return com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_ELIMINATED;
+        }
+        if (DownedManager.INSTANCE.isDowned(playerId)) {
+            return com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_DOWNED;
+        }
+        return com.paimeng.battleroyale.network.TeamSyncPayload.STATUS_ALIVE;
     }
 
     /**
@@ -364,7 +492,7 @@ public final class MatchTeamManager {
         }
         Team lobby = TeamManager.INSTANCE.teamOf(playerId);
         if (lobby != null) {
-            for (Team.Entry entry : lobby.membersSortedByNumber()) {
+            for (Team.Entry entry : lobby.membersInJoinOrder()) {
                 result.add(entry.playerId());
             }
             return result;
@@ -373,36 +501,26 @@ public final class MatchTeamManager {
         return result;
     }
 
-    /** 队伍编号：局内 MatchTeam 编号优先，大厅队编号兜底；无队伍 0。 */
-    public int teamNumberOf(UUID playerId) {
-        MatchTeam team = active ? playerToTeam.get(playerId) : null;
-        if (team != null) {
-            return team.getTeamNumber();
-        }
-        Team lobby = TeamManager.INSTANCE.teamOf(playerId);
-        return lobby == null ? 0 : lobby.getTeamNumber();
-    }
-
-    /** 队内座号 / 大厅编号：局内优先。 */
+    /**
+     * 只查询本局 MatchTeam 的座号；大厅阶段明确返回 -1。
+     * [BR-NOLOBBYNUMBER] 大厅队没有 squadIndex，避免快捷消息/标点误用大厅成员顺序上色。
+     */
     public int squadIndexOf(UUID playerId) {
         MatchTeam team = active ? playerToTeam.get(playerId) : null;
-        if (team != null) {
-            return team.squadIndexOf(playerId);
-        }
-        Team lobby = TeamManager.INSTANCE.teamOf(playerId);
-        return lobby == null ? -1 : lobby.numberOf(playerId);
+        return team == null ? -1 : team.squadIndexOf(playerId);
     }
 
-    /** 存活队伍数（队伍里还有未被淘汰的成员就算存活）；未开局返回 -1。 */
+    /** 存活队伍数（队伍里还有未被本局淘汰的成员就算存活）；未开局返回 -1。 */
     public int aliveTeamCount() {
         if (!active) {
             return -1;
         }
-        DownedManager downed = DownedManager.INSTANCE;
         int alive = 0;
         for (MatchTeam team : teams) {
+            // [BR-TEAMHUD] 淘汰判定统一走本局名册（含 DownedManager 瞬时标记兜底），
+            // 与队伍 HUD 的 ELIMINATED 状态同一份真相。
             for (UUID memberId : team.memberIds()) {
-                if (!downed.isEliminated(memberId)) {
+                if (!wasEliminatedThisMatch(memberId)) {
                     alive++;
                     break;
                 }
@@ -411,9 +529,20 @@ public final class MatchTeamManager {
         return alive;
     }
 
-    /** 本局是否已分出胜负（只剩 0~1 支存活队伍）；未开局返回 false。 */
+    /**
+     * 本局是否已分出胜负（只剩 0~1 支存活队伍）；未开局返回 false。
+     *
+     * <p>[BR-WINGUARD] 必须开局就分发过 >= 2 支队伍才可能判胜负：
+     * 单人/单队测试局存活队伍数恒等于 1，不加这道门槛会导致
+     * RUNNING 后第 1 个 tick 就误判"冠军产生"直接 ENDED。
+     */
     public boolean isMatchDecided() {
-        return active && aliveTeamCount() <= 1;
+        return active && startedTeamCount >= 2 && aliveTeamCount() <= 1;
+    }
+
+    /** [BR-WINGUARD] 开局分发出去的 MatchTeam 总数（未开局为 0），供结算/日志用。 */
+    public int startedTeamCount() {
+        return startedTeamCount;
     }
 
     // ------------------------------------------------------------------
@@ -466,6 +595,10 @@ public final class MatchTeamManager {
                 // 这里的大厅快照不会再被 sendTo 里的“局内覆盖保护”拦掉。
                 TeamSync.sendTo(player, lobby == null ? TeamSyncPayload.empty() : TeamSync.of(lobby));
             }
+            // [BR-NAMETAG] / [BR-MINIMAP] 本局结束：花名册与队友坐标一起清干净，
+            // 头顶名字恢复原样、小地图队友图标消失（大厅阶段不留局内视觉残留）。
+            broadcastEmptyRoster(server);
+            TeammatePosSync.broadcastClear(server);
         }
         BattleRoyaleMod.LOGGER.info("[BR-MATCHTEAM] 本局 MatchTeam 已销毁，{} 名玩家的队伍视图恢复为大厅状态",
                 affected.size());
@@ -478,8 +611,10 @@ public final class MatchTeamManager {
 
     private void clearInternal() {
         active = false;
+        startedTeamCount = 0;
         teams.clear();
         playerToTeam.clear();
+        eliminatedThisMatch.clear();
         startBlockedSignature.clear();
     }
 
@@ -497,12 +632,13 @@ public final class MatchTeamManager {
         return map.maxTeamSize;
     }
 
-    private static int lobbyNumberOf(Team lobby, UUID playerId) {
+    /** 开局分配瞬间把大厅加入顺序转换成排序键；这个键不属于大厅数据，也不下发客户端。 */
+    private static int lobbyOrderOf(Team lobby, UUID playerId) {
         if (lobby == null) {
             return 0;
         }
-        int number = lobby.numberOf(playerId);
-        return number < 0 ? 999 : number;
+        int order = lobby.joinOrderOf(playerId);
+        return order < 0 ? 999 : order;
     }
 
     private static boolean isLobbyLeader(UUID playerId) {

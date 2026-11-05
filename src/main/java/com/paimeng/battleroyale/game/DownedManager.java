@@ -1,15 +1,17 @@
 package com.paimeng.battleroyale.game;
 
+import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.event.EventBus;
+import com.paimeng.battleroyale.event.PlayerDownedEvent;
 import com.paimeng.battleroyale.event.PlayerEliminatedEvent;
 import com.paimeng.battleroyale.item.ModItems;
+import com.paimeng.battleroyale.item.SpeedBoostManager;
 import com.paimeng.battleroyale.network.DownedSync;
 import com.paimeng.battleroyale.network.DownedSyncPayload;
 import com.paimeng.battleroyale.team.MatchTeamManager;
 import com.paimeng.battleroyale.team.Team;
 import com.paimeng.battleroyale.team.TeamManager;
 import com.paimeng.battleroyale.zone.ZoneManager;
-import com.paimeng.battleroyale.zone.ZoneStage;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.LivingEntity;
@@ -59,6 +61,19 @@ public final class DownedManager {
     private final Map<UUID, SelfRescue> selfRescues = new HashMap<>();
     private final Set<UUID> eliminated = new HashSet<>();
 
+    /**
+     * [r-LEAVE] 最后一次"玩家造成的伤害"记账：受害者 UUID →（攻击者 UUID、毫秒时间戳）。
+     * 防"战斗拔线 / 交战中途 br leave"：br leave 判阵亡与断线判阵亡都优先把击杀
+     * 结算给窗口期内的最后伤害来源；淘汰结算消费后即时清除。
+     */
+    private final Map<UUID, CombatHit> lastCombatHits = new HashMap<>();
+    /** [r-LEAVE] 交战归因窗口（毫秒）：最后一次玩家伤害超过这个时长就不再算"刚被打"。 */
+    private static final long COMBAT_ATTRIBUTION_WINDOW_MS = 10_000L;
+
+    /** 最近一次玩家伤害记录（victim 视角）。 */
+    private record CombatHit(UUID attackerId, long atMs) {
+    }
+
     public void reset(MinecraftServer server) {
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             if (isDowned(player.getUUID())) {
@@ -77,6 +92,7 @@ public final class DownedManager {
         rescuerMap.clear();
         selfRescues.clear();
         eliminated.clear();
+        lastCombatHits.clear();
     }
 
     private DownedManager() {
@@ -101,6 +117,9 @@ public final class DownedManager {
         eliminated.remove(id);
         clearNameplate(player);
         DownedSync.broadcast(player.server, DownedSyncPayload.empty(id));
+        // [BR-TEAMHUD] 状态切换当场重发本队快照：队友 HUD 立即把该成员恢复成正常显示
+        // （救起、淘汰收尾、复活指令等所有走这里的变更都会联动）。
+        MatchTeamManager.INSTANCE.resyncStatusFor(id, player.server);
     }
 
     /** 按 UUID 清除指定玩家的核心击倒状态；供淘汰、救起、自救和复活流程调用。 */
@@ -143,6 +162,9 @@ public final class DownedManager {
         clearPlayerState(id);
         clearNameplate(player);
         DownedSync.broadcast(server, DownedSyncPayload.empty(id));
+        // [BR-TEAMHUD][BR-RECONNECT] 掉线不等于淘汰：倒地标记已清，
+        // 全队 HUD 把他恢复成正常显示（重连后按名册判定继续打还是观战）。
+        MatchTeamManager.INSTANCE.resyncStatusFor(id, server);
     }
 
     /** 剩余击倒血量（0 ~ 20）；未处于击倒状态返回 -1。 */
@@ -164,7 +186,8 @@ public final class DownedManager {
             enterDowned(player, source);
             return false;
         }
-        // C：只记录播报、统计和事件，放行原版 onDeath 完成掉落与死亡界面。
+        // C：只记录播报、统计和事件，放行原版死亡界面与经验掉落；
+        // 装备掉落已被 mixin.PlayerDeathChestMixin 在 Player#die HEAD 改成死亡箱（骨灰盒）。
         eliminate(player, source, false, false);
         return true;
     }
@@ -179,6 +202,14 @@ public final class DownedManager {
             return true;
         }
         UUID id = player.getUUID();
+        // [r-LEAVE] 先记最后玩家伤害（能通过 mixin 的队友免伤 / 热身无敌 / 航线无敌
+        // 拦截到这里、且真的造成伤害的都算）：供 br leave / 断线判阵亡做击杀归因兜底。
+        if (amount > 0.0f) {
+            ServerPlayer attacker = KillFeed.resolveKiller(player, source);
+            if (attacker != null) {
+                lastCombatHits.put(id, new CombatHit(attacker.getUUID(), System.currentTimeMillis()));
+            }
+        }
         Float health = downedHealthMap.get(id);
         if (health == null) {
             return true;
@@ -236,12 +267,13 @@ public final class DownedManager {
         // 倒地后被传送回主城 / 别的地图的玩家，runtimeAt 返回 null，天然不吃毒。
         ZoneManager.ZoneRuntime zone = ZoneManager.INSTANCE.runtimeAt(player.level().dimension());
         if (zone == null || !zone.phase().isActive()) return 0.0f;
-        ZoneStage stage = zone.currentStage();
-        if (stage == null) return 0.0f;
-        float dps = stage.damagePerSecond();
-        if (dps <= 0.0f) return 0.0f;
+        // [r148 TTK 模型] 倒地玩家走独立血量池（每 tick 浮点扣），口径和站立的完全一致：
+        // 每秒伤害 = 玩家实际上限血量 / 当前阶段圈外淘汰秒数，再除以 20 就是每 tick 应扣的量
+        // （独立血量池不存在无敌帧吞伤害的问题）。
+        double ttk = zone.zoneTtkSeconds();
+        if (!(ttk > 0.0)) return 0.0f;
         if (!zone.isOutside(player.getX(), player.getZ())) return 0.0f;
-        return dps / 20.0f;
+        return (float) (player.getMaxHealth() / ttk / 20.0);
     }
 
     private void enterDowned(ServerPlayer player, DamageSource source) {
@@ -261,8 +293,12 @@ public final class DownedManager {
         player.displayClientMessage(Component.literal("你被击倒了！等待队友救援或长按自救器，剩余 60 秒。"), true);
         updateNameplate(player, DOWNED_HEALTH_MAX);
         sync(player.server, player);
-        broadcastOutcome(player, source, false);
+        // [BR-KILLFEED] 击倒播报改走事件总线：KillFeed 按观看者视角千人千面分发。
+        EventBus.INSTANCE.publish(new PlayerDownedEvent(player, source,
+                KillFeed.resolveKiller(player, source), player.server));
         checkTeamCollapse(player.server, player);
+        // [BR-TEAMHUD] 倒地瞬间联动队伍 HUD：全队立刻把该成员画成深红"倒地"。
+        MatchTeamManager.INSTANCE.resyncStatusFor(id, player.server);
     }
 
     private boolean hasLivingTeammate(ServerPlayer player) {
@@ -374,48 +410,113 @@ public final class DownedManager {
         UUID id = player.getUUID();
         clearPlayerState(id);
         eliminated.add(id);
+        // [r-LEAVE] 正式淘汰即消费掉最后伤害记录，避免结算窗口跨事件残留。
+        lastCombatHits.remove(id);
         clearNameplate(player);
         if (!YSM_LOADED) player.setPose(Pose.STANDING);
         StatsManager.INSTANCE.onEliminated(player, source);
-        broadcastOutcome(player, source, true, bleedout);
-        EventBus.INSTANCE.publish(new PlayerEliminatedEvent(player, source, player.server));
+        // [BR-DEATHCHEST][r-fix3] 关键顺序：必须在切成旁观模式<b>之前</b>结算死亡箱。
+        // DeathChestManager.eligible 会排除旁观 / 创造玩家（原版本来不掉装备），
+        // 而旧逻辑先 onEliminated 切旁观、后 die()，导致 die 里的 Mixin 判定为旁观
+        // 直接拒绝收装备——骨灰盒永不生成、物品原地消失。这里趁玩家仍是生存显式收走。
+        boolean chestPlaced = DeathChestManager.onDeath(player);
+        BattleRoyaleMod.LOGGER.info("[BR-DEATHCHEST] {} 淘汰：切旁观前显式结算死亡箱 -> {}",
+                player.getGameProfile().getName(), chestPlaced ? "已生成" : "未生成（空背包 / 局外 / 不可用地面）");
+        // [BR-GAMEMODE] 淘汰 → 旁观模式：先切换再判死，死亡界面直接落在观战视角。
+        GameModeManager.INSTANCE.onEliminated(player);
         if (finalizeDeath && !player.isRemoved()) {
             player.setHealth(0.0f);
             player.die(source);
         }
         checkTeamCollapse(player.server, player);
+        // [BR-KILLFEED][BR-SETTLE] 播报 / 全队覆灭 / 前三 / 吃鸡全部走事件总线。
+        // 发布放在级联淘汰之后：此刻本队淘汰名册已是最终状态，订阅方的
+        // 覆灭与存活队伍数判定不会读到半更新数据（重复播报由订阅方自行去重）。
+        EventBus.INSTANCE.publish(new PlayerEliminatedEvent(player, source,
+                KillFeed.resolveKiller(player, source), bleedout, false, false, player.server));
         // 淘汰流程最后一步清理完整状态，并发送 isClear=true 包给所有客户端。
         clearPlayer(player);
     }
 
     /**
-     * 赛中逃跑（/paimengmods br leave 判定阵亡）入口：走与被击杀完全相同的服务端淘汰管线——
-     * 清击倒状态与减速/虚弱、标记淘汰、存活人数结算（StatsManager）、
-     * 发布淘汰事件、队伍坍缩检查（checkTeamCollapse），最后广播清除包刷新各客户端 HUD。
+     * [r-LEAVE] 赛中判阵亡统一入口（{@code br leave} 主动退出、断线重连补判共用）：
+     * 走与被击杀<b>完全相同</b>的服务端淘汰管线——
+     * 原地生成死亡掉落箱（骨灰盒）→ 清击倒状态 → 标记淘汰 → 清全部 Buff
+     * （医疗回血/移速、倒地减速虚弱、缓降）→ 收降落伞并归还飞行豁免
+     * → 存活人数与击杀数结算（含「战斗拔线」归因，见下）→ 队伍坍缩级联
+     * → 发布淘汰事件（本局名册、队伍 HUD、全队覆灭播报、前三/吃鸡排名结算
+     * 全部由订阅方按「阵亡」口径照常完成）→ 广播清除包。
+     * 调用方<b>之后</b>才允许传送回大厅并恢复原游戏模式。
      *
-     * <p>与被击杀仅有两点差异：
+     * <p>与被击杀仅两处刻意差异：
      * <ol>
-     *   <li>不走原版死亡结算（不弹死亡界面、不掉装备）——逃跑者随后就被传送回大厅，
-     *       走 finalizeDeath 会在传送瞬间触发死亡界面，交互不对；</li>
-     *   <li>不发「击杀/圈外淘汰」播报——聊天文案由指令层按「逃跑」口径广播。</li>
+     *   <li>不切旁观、不调 {@code player.die}——人马上被传送回大厅恢复原模式，
+     *       死亡界面与旁观视角都不该出现；Buff 清理因此改为在本方法内显式完成；</li>
+     *   <li>播报口径：主动退出（voluntaryQuit=true）照常走击倒/淘汰播报，
+     *       有最近玩家伤害来源就按正常击杀播（Kill 记给他），没有则记
+     *       「环境/主动退出」；断线补判（voluntaryQuit=false、desert=true）跳过
+     *       击杀文案（指令层已按「逃跑」口径广播），覆灭与排名结算不受影响。</li>
      * </ol>
+     *
+     * <p>防「战斗拔线」：{@value #COMBAT_ATTRIBUTION_WINDOW_MS} 毫秒内吃过玩家伤害的，
+     * 死因按最后伤害来源结算——攻击者离线 / 已死 / 超时则退回环境口径。
+     *
+     * @param voluntaryQuit true = 玩家在局内主动 br leave；false = 断线重连补判阵亡
      */
-    public void eliminateForDesert(ServerPlayer player) {
+    public void eliminateForDesert(ServerPlayer player, boolean voluntaryQuit) {
         UUID id = player.getUUID();
-        if (eliminated.contains(id)) {
-            return; // 已经淘汰过，防止重复扣人数
+        if (eliminated.contains(id) || MatchTeamManager.INSTANCE.wasEliminatedThisMatch(id)) {
+            return; // 已经正式结算过：绝不二次扣存活人数、二次发骨灰盒
         }
+        // [r-LEAVE] 击杀归因：窗口期内最后玩家伤害来源优先，否则按环境/主动退出。
+        ServerPlayer attacker = recentAttackerOf(player);
+        DamageSource source = attacker != null
+                ? player.damageSources().mobAttack(attacker)
+                : player.damageSources().generic();
+        lastCombatHits.remove(id);
+        // 1) 骨灰盒在阵亡点原位生成——必须趁玩家仍是生存模式、背包未动之前结算
+        //    （与正常淘汰的 [BR-DEATHCHEST][r-fix3] 顺序要求同一口径）。
+        boolean chestPlaced = DeathChestManager.onDeath(player);
+        BattleRoyaleMod.LOGGER.info("[BR-LEAVE] {} 判阵亡：死亡箱 -> {}（击杀归因：{}）",
+                player.getGameProfile().getName(), chestPlaced ? "已生成" : "未生成",
+                attacker == null ? "环境/主动退出" : attacker.getGameProfile().getName());
+        // 2) 击倒状态清理 + 进淘汰标记。
         clearPlayerState(id);
         eliminated.add(id);
         clearNameplate(player);
         if (!YSM_LOADED) player.setPose(Pose.STANDING);
-        player.removeEffect(MobEffects.MOVEMENT_SLOWDOWN);
-        player.removeEffect(MobEffects.WEAKNESS);
-        StatsManager.INSTANCE.onEliminated(player, player.damageSources().generic());
-        EventBus.INSTANCE.publish(new PlayerEliminatedEvent(player, player.damageSources().generic(), player.server));
+        // 3) Buff 全清：医疗回血（再生）、能量饮料/止痛药移速（属性修饰符）、
+        //    倒地减速虚弱、降落伞缓降——不走 die/respawn，就必须在这里显式摘干净。
+        player.removeAllEffects();
+        SpeedBoostManager.remove(player);
+        // 4) 跳伞途中退出：向同维度客户端收伞 + 归还零重力/无敌/飞行豁免（幂等）。
+        FlightManager.INSTANCE.handleDesert(player);
+        // 5) 存活人数 -1、击杀数结算（source.getEntity() = attacker 时 Kills 记给最后伤害者）。
+        StatsManager.INSTANCE.onEliminated(player, source);
+        // 6) 全队覆灭级联：队友全倒地且无人能救时统一补淘汰（与被击杀同一实现）。
         checkTeamCollapse(player.server, player);
-        // 与被击杀的最后一步一致：清完整状态并向所有客户端广播清除包（淘汰标记不留存，同原版流程）。
+        // 7) 淘汰事件：主动退出走正常播报管线（desert=false、voluntaryQuit=true），
+        //    名册 / HUD / 覆灭播报 / 排名结算全部由订阅方照常完成。
+        EventBus.INSTANCE.publish(new PlayerEliminatedEvent(player, source, attacker,
+                false, !voluntaryQuit, voluntaryQuit, player.server));
+        // 8) 与被击杀的最后一步一致：清完整状态并向所有客户端广播清除包。
         clearPlayer(player);
+    }
+
+    /**
+     * [r-LEAVE] 取受害者窗口期（{@value #COMBAT_ATTRIBUTION_WINDOW_MS} 毫秒）内的最后
+     * 玩家伤害来源；超时、攻击者已离线或已死亡都算没有（返回 null，走"环境/主动退出"口径）。
+     */
+    public ServerPlayer recentAttackerOf(ServerPlayer victim) {
+        CombatHit hit = lastCombatHits.get(victim.getUUID());
+        if (hit == null || System.currentTimeMillis() - hit.atMs() > COMBAT_ATTRIBUTION_WINDOW_MS) {
+            return null;
+        }
+        if (victim.server == null) {
+            return null;
+        }
+        ServerPlayer attacker = victim.server.getPlayerList().getPlayer(hit.attackerId());
+        return attacker == null || attacker == victim || !attacker.isAlive() ? null : attacker;
     }
 
     private void checkTeamCollapse(MinecraftServer server, ServerPlayer changed) {
@@ -445,7 +546,7 @@ public final class DownedManager {
         Team lobby = TeamManager.INSTANCE.teamOf(changed.getUUID());
         if (lobby == null) return java.util.List.of();
         java.util.List<UUID> ids = new java.util.ArrayList<>();
-        for (Team.Entry entry : lobby.membersSortedByNumber()) ids.add(entry.playerId());
+        for (Team.Entry entry : lobby.membersInJoinOrder()) ids.add(entry.playerId());
         return ids;
     }
 
@@ -465,54 +566,6 @@ public final class DownedManager {
         shownPercent.remove(player.getUUID());
         if (player.hasCustomName()) player.setCustomName(null);
         player.setCustomNameVisible(false);
-    }
-
-    /**
-     * 击杀者主手武器的显示名；空手（AIR 或空槽）时返回「拳头」。
-     * 不再使用 DamageSource.getName()——它返回的是伤害类型内部名（如 player），不是武器。
-     */
-    private static String weaponName(ServerPlayer attacker) {
-        ItemStack stack = attacker.getMainHandItem();
-        if (stack.isEmpty() || stack.is(Items.AIR)) {
-            return "拳头";
-        }
-        String name = stack.getHoverName().getString();
-        return name == null || name.isBlank() ? "拳头" : name;
-    }
-
-    /** eliminated=true 播报「淘汰了」，false 播报「击倒了」；毒圈判定与颜色、距离规则两者一致。 */
-    private void broadcastOutcome(ServerPlayer victim, DamageSource source, boolean eliminated) {
-        broadcastOutcome(victim, source, eliminated, false);
-    }
-
-    private void broadcastOutcome(ServerPlayer victim, DamageSource source, boolean eliminated, boolean bleedout) {
-        ServerPlayer killer = source.getEntity() instanceof ServerPlayer p ? p : null;
-        boolean zone = source.is(net.minecraft.world.damagesource.DamageTypes.MAGIC) || killer == null;
-        String verb = eliminated ? "淘汰了" : "击倒了";
-        for (ServerPlayer receiver : victim.server.getPlayerList().getPlayers()) {
-            boolean victimAlly = sameTeam(receiver, victim);
-            boolean killerAlly = killer != null && sameTeam(receiver, killer);
-            int color = victimAlly ? 0xFF5555 : killerAlly ? 0x55FF55 : 0xFFFF55;
-            Component message;
-            if (bleedout) {
-                message = Component.literal(victim.getGameProfile().getName()
-                        + " 因为在倒地后没有人救援而被淘汰");
-            } else if (zone) {
-                message = Component.literal(victim.getGameProfile().getName()
-                        + " 因为在安全区外停留时间太长而被" + (eliminated ? "淘汰" : "击倒"));
-            } else {
-                String weapon = weaponName(killer);
-                String suffix = receiver.distanceToSqr(victim) > 2500.0
-                        ? "（" + Math.round(Math.sqrt(receiver.distanceToSqr(victim))) + " 米外）" : "";
-                message = Component.literal(killer.getGameProfile().getName() + " 使用 " + weapon + " " + verb
-                        + " " + victim.getGameProfile().getName() + suffix);
-            }
-            receiver.displayClientMessage(message.copy().setStyle(message.getStyle().withColor(color)), false);
-            // 音效只在「淘汰」且与接收者所在队伍相关时播放（击倒播报不播音效）。
-            if (eliminated && (bleedout ? victimAlly : (victimAlly || killerAlly))) {
-                receiver.playSound(SoundEvents.NOTE_BLOCK_PLING.value(), 1.0f, 1.0f);
-            }
-        }
     }
 
     /** 同步包：包含击倒血量、救援者 UUID、进度比例和剩余秒数。 */

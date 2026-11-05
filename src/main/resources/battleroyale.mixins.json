@@ -4,14 +4,20 @@
   "package": "com.paimeng.battleroyale.mixin",
   "compatibilityLevel": "JAVA_17",
   "mixins": [
+    "DimensionTypeMixin",
+    "FoodDataMixin",
     "LivingEntityMixin",
     "MinecraftServerAccessor",
     "MinecraftServerMixin",
     "PlayerConnectionAccessor",
+    "PlayerDeathChestMixin",
     "PlayerManagerMixin",
     "ServerPlayerAccessor",
-    "ServerWorldMixin",
-    "DimensionTypeMixin"
+    "ServerWorldMixin"
+  ],
+  "client": [
+    "ChatScreenMixin",
+    "NameTagRenderMixin"
   ],
   "injectors": {
     "defaultRequire": 1

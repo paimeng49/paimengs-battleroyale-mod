@@ -22,11 +22,11 @@ import net.minecraft.ChatFormatting;
  *       频道、本人位置，不受"玩家声音"子频道和实体追踪影响），标点和快捷消息都传 true。</li>
  *   <li>{@link #sendToSelf(ServerPlayer, Component)}：只发给发送者本人（没队伍时的
  *       兜底路径），同样响一声经验球拾取音，保持手感一致。</li>
- *   <li>{@link #buildTeamMessage(ServerPlayer, Component)}：拼一条带队伍前缀的消息：
- *       {@code [队伍 3][2] 名字: 内容}，编号和名字用<b>该队员队内编号对应</b>的标志色
- *       （1 黄、2 橙（金）、3 蓝（天蓝）、4 绿，超出 4 号兜底白——和 HUD 那套
- *       {@code TeamHudRenderer.colorOf} 的取色规则一致，只是这边用聊天用的
- *       {@link ChatFormatting}，那边用屏幕画字的 ARGB 数字）。</li>
+ *   <li>{@link #buildTeamMessage(ServerPlayer, Component)}：拼一条带队伍前缀的消息。
+ *       局内 MatchTeam = {@code [#N队][座号] 名字: 内容}（座号和名字用<b>局内座号</b>
+ *       对应的标志色：1 黄、2 橙（金）、3 蓝（天蓝）、4 绿，超出兜底白）；
+ *       大厅队 = {@code [队伍] 名字: 内容}（<b>[BR-NOLOBBYNUMBER] 不带任何编号、
+ *       不带战术色</b>——大厅阶段还没有局内座号可上色）。</li>
  * </ul>
  *
  * <p>为什么塞进 {@code team} 包：发送逻辑只依赖 {@link TeamManager}/{@link Team}，
@@ -119,38 +119,36 @@ public final class TeamMessageSender {
     // ------------------------------------------------------------------
 
     /**
-     * 拼一条带队伍前缀的消息：{@code [队伍 3][2] 名字: 内容}。
-     * 编号与名字用"队内编号固定对应"的标志色；发送者没队伍时退化成
-     * {@code 名字: 内容}（调用方通常在没队伍时会走全服兜底）。
+     * 拼一条队伍消息：局内 MatchTeam 才显示 "[#N队][座号]" 和座号颜色；
+     * 大厅队只显示不带编号、不带战术色的 "[队伍] 名字"。
      */
     public static MutableComponent buildTeamMessage(ServerPlayer sender, Component content) {
-        // [UPGRADE] 1.20.5+ sender.getName() 行为不变；sendMessage 在 sendToTeam 里改
         String name = sender.getGameProfile().getName();
-        MutableComponent message = BrText.mutable(name + ": ").withStyle(ChatFormatting.WHITE);
-        // [BR-MATCHTEAM] 编号取数走 MatchTeamManager：局内是 "#N队 + 座号"，
-        // 大厅 / 未开局是 "队伍 N + 队内编号"。
         java.util.UUID senderId = sender.getUUID();
-        int number = MatchTeamManager.INSTANCE.squadIndexOf(senderId);
-        if (number > 0) {
-            int teamNumber = MatchTeamManager.INSTANCE.teamNumberOf(senderId);
-            String prefix = MatchTeamManager.INSTANCE.isActive() && MatchTeamManager.INSTANCE.isAssigned(senderId)
-                    ? "#" + teamNumber + "队"
-                    : "队伍 " + teamNumber;
-            ChatFormatting color = formattingOf(number);
-            message = BrText.mutable("[" + prefix + "] ").withStyle(ChatFormatting.GRAY)
-                    .append(BrText.mutable("[" + number + "] " + name + " ").withStyle(color))
-                    .append(BrText.mutable(": ").withStyle(ChatFormatting.GRAY));
+        MatchTeam matchTeam = MatchTeamManager.INSTANCE.teamOf(senderId);
+        if (matchTeam != null) {
+            int seat = matchTeam.squadIndexOf(senderId);
+            return BrText.mutable("[#" + matchTeam.getTeamNumber() + "队] ").withStyle(ChatFormatting.GRAY)
+                    .append(BrText.mutable("[" + seat + "] " + name + " ").withStyle(formattingOf(seat)))
+                    .append(BrText.mutable(": ").withStyle(ChatFormatting.GRAY))
+                    .append(content);
         }
-        return message.append(content);
+        if (com.paimeng.battleroyale.team.TeamManager.INSTANCE.teamOf(senderId) != null) {
+            return BrText.mutable("[队伍] ").withStyle(ChatFormatting.GRAY)
+                    .append(BrText.mutable(name + ": ").withStyle(ChatFormatting.WHITE))
+                    .append(content);
+        }
+        return BrText.mutable(name + ": ").withStyle(ChatFormatting.WHITE).append(content);
     }
 
     /**
-     * 队内编号 → 聊天标志色。规则与屏幕 HUD（{@code TeamHudRenderer.colorOf}）一致：
-     * 1 黄、2 橙、3 蓝、4 绿；编号越界（含 0 / 负数，异常情况）兜底白色。
+     * <b>局内座号</b> → 聊天标志色（只有 MatchTeam 才有座号，大厅队拿不到颜色）。
+     * 规则与屏幕 HUD（{@code TeamHudRenderer.colorOf}）一致：
+     * 1 黄、2 橙、3 蓝、4 绿；座号越界（含 0 / 负数，异常情况）兜底白色。
      * 聊天只有 16 色可用，橙色/蓝色取最接近的 GOLD / AQUA。
      */
-    public static ChatFormatting formattingOf(int memberNumber) {
-        return switch (memberNumber) {
+    public static ChatFormatting formattingOf(int squadIndex) {
+        return switch (squadIndex) {
             case 1 -> ChatFormatting.YELLOW;   // 0xFFFF00
             case 2 -> ChatFormatting.GOLD;     // ≈0xFFAA00（最接近 0xFFA500 橙色）
             case 3 -> ChatFormatting.AQUA;     // ≈0x55FFFF（最接近 0x00BFFF 天蓝）

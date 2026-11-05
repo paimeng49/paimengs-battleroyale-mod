@@ -48,6 +48,7 @@ public final class ClientFlightState {
      * 落地，飞机到 B 即刻消失——和"实体 discard"时代的观感一致。
      */
     private static volatile boolean planeRunning;
+    private static volatile boolean airdropRoute;
 
     private static volatile boolean active;
     private static volatile String mapId = "";
@@ -91,6 +92,10 @@ public final class ClientFlightState {
             jumpSent = false;
             return;
         }
+        // 新包无论是普通航线还是空投航线都彻底覆盖旧状态，重置时间轴和进度缓存。
+        clockAnchored = false;
+        planeRunning = false;
+        airdropRoute = payload.isAirdrop();
         mapId = payload.mapId() == null ? "" : payload.mapId();
         startX = payload.ax();
         startZ = payload.az();
@@ -112,7 +117,6 @@ public final class ClientFlightState {
         startTick = payload.startTick();
         // [BR-MTR2] 新一轮航线：纪元重新对表。speed>0 = 飞机已在飞（begin 正式包）；
         // 预热预告包 speed=0，只画地图线，纯函数保持未激活。
-        clockAnchored = false;
         planeRunning = speed > 1.0e-9;
         jumpSent = false;
         active = true;
@@ -157,6 +161,7 @@ public final class ClientFlightState {
         jumpSent = false;
         clockAnchored = false;
         planeRunning = false;
+        airdropRoute = false;
         mapId = "";
         startX = 0;
         startZ = 0;

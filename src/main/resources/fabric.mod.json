@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "battleroyale",
   "version": "${version}",
-  "name": "大逃杀",
+  "name": "Paimon's Battle Royale",
   "description": "大逃杀玩法核心：游戏状态机（WAITING/PREPARING/RUNNING/ENDED）、自定义事件总线、/paimengmods br 指令、多阶段毒圈收缩与蓝色能量墙渲染、极简队伍系统（/paimengmods br team create|invite|accept|leave|list + 左上角队友编号 HUD，不同编号不同标志色）、聊天快捷消息（/paimengmods qc 仅预设消息、只发队伍频道）、标点系统（V 键：单击标记地点、双击标记敌人，世界发光标记 + 经验拾取音效，小地图接口预留）。撤离点、跳伞、GUI 后续接入。",
   "authors": [
     "paimeng"

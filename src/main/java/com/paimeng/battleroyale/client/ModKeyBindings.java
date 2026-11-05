@@ -69,8 +69,11 @@ public final class ModKeyBindings {
     public static void tick(Minecraft client) {
         lockOntoPlane(client);
 
+        // [BR-HUD-DIM] 全屏地图和小地图同一口径：只在比赛维度 battleroyale_game:* 打开。
+        // 大厅按 M 不再弹出一张和脚下地形无关的旧底图。
         if (openFullMap != null && openFullMap.consumeClick()
-                && client.screen == null && client.level != null && client.player != null) {
+                && client.screen == null && client.level != null && client.player != null
+                && GameWorldManager.isGameWorld(client.level.dimension())) {
             client.setScreen(new FullscreenMapScreen());
         }
         if (parachute == null) {
@@ -143,6 +146,11 @@ public final class ModKeyBindings {
         if (!ClientFlightState.planeSyncActive()
                 || !ClientFlightState.visibleIn(client.level.dimension())) {
             return; // 未锚定 / 不在本航线维度：交还原版物理（服务端 TP 兜底）
+        }
+        // [BR-AIRDROP 模块三] 空投 C-130 复用同一条 flight 通道做渲染：毒圈已经开跑
+        // （RUNNING，Zone 快照在场）时航线只该"看"，绝不把地面上的玩家钉上飞机。
+        if (ClientZoneState.isPresent() && ClientZoneState.visibleIn(client.level.dimension())) {
+            return;
         }
         // [BR-LOCK2] 这里绝不做 isOnGround() 一类的"落地豁免"判定：刚登机的那几个 tick
         // 玩家客户端侧 isOnGround 仍可能为 true，一旦据此 return，锁定就整段失效，

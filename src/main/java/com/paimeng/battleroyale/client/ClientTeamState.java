@@ -80,7 +80,7 @@ public final class ClientTeamState {
         return snapshot.leaderId();
     }
 
-    /** 成员列表，已按队内编号升序。 */
+    /** 成员列表：局内快照按座号升序，大厅快照按加入顺序（[BR-NOLOBBYNUMBER] 大厅无编号）。 */
     public static List<TeamSyncPayload.Member> members() {
         return snapshot.members();
     }

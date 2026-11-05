@@ -13,7 +13,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.resources.ResourceLocation;
 
 /**
- * 毒圈状态的服务端 → 客户端同步（S2C 自定义网络包，r109 协议 v2）。
+ * 毒圈状态的服务端 → 客户端同步（S2C 自定义网络包，r198 协议 v3）。
  *
  * <p><b>模块三</b>：对局进行中，每个 tick 给每个装了模组的客户端同步一次
  * 当前蓝圈（收缩起点圆）、下个白圈（目标圆）、状态、剩余倒计时（秒）与缩圈总进度
@@ -28,6 +28,11 @@ import net.minecraft.resources.ResourceLocation;
  * <p>只发装了本模组的客户端（{@link ServerPlayNetworking#canSend}），
  * 原版客户端 / 没装模组的玩家会被跳过，不会因为他收不到包而踢线。
  *
+ * <p><b>模块四升级（r198 v3）</b>：包尾追加逐玩家的圈外每秒伤害 DPS
+ * （服务端按"该玩家最大血量 / 本阶段 TTK"算好下发）。客户端
+ * {@code ZoneTtkCountdown} 用它做纯时间外推的淘汰倒计时，
+ * 不再依赖"血量真的掉了 1 点"才刷新数字。
+ *
  * <p><b>升级预留</b>：本文件只有三处贴版本 API，都标了 [UPGRADE]。
  * 1.19 起 {@code PacketByteBufs} 从 Fabric 挪进原版；
  * 1.20.5+ 起自定义包要改成 {@code CustomPayload} 记录 + {@code ServerPlayNetworking.send(player, payload)}，
@@ -35,7 +40,7 @@ import net.minecraft.resources.ResourceLocation;
  */
 public final class ZoneSync {
 
-    /** 通道名：battleroyale:zone_sync（协议 v2：白圈 + 倒计时 + 进度 + 维度）。 */
+    /** 通道名：battleroyale:zone_sync（协议 v3：白圈 + 倒计时 + 进度 + 维度 + TTK + 圈外 DPS）。 */
     public static final ResourceLocation CHANNEL_ID = new ResourceLocation(BattleRoyaleMod.MOD_ID, "zone_sync");
 
     private static final ZonePhase[] PHASES = ZonePhase.values();
@@ -88,7 +93,13 @@ public final class ZoneSync {
         }
         ZoneManager.ZoneRuntime zone = ZoneManager.INSTANCE.runtimeAt(player.level().dimension());
         ZoneSnapshot snapshot = zone == null ? ZoneSnapshot.idle() : zone.snapshot();
-        ServerPlayNetworking.send(player, CHANNEL_ID, encode(snapshot));
+        // [r198 协议 v3] 逐玩家注入圈外 DPS：与服务端 applyZoneDamage 的每秒步进同口径
+        // （实际最大血量 / 本阶段 TTK）；phaseZero（还没开始掉血）时快照里 ttk=0，DPS 同步为 0。
+        double dps = 0.0;
+        if (zone != null && snapshot.zoneTtkSeconds() > 0.0) {
+            dps = player.getMaxHealth() / snapshot.zoneTtkSeconds();
+        }
+        ServerPlayNetworking.send(player, CHANNEL_ID, encode(snapshot.withDamagePerSecond(dps)));
     }
 
     /** 进服补发：玩家刚连接时调一次，立刻拿到所在维度的毒圈状态（或 IDLE）。 */
@@ -118,6 +129,12 @@ public final class ZoneSync {
         buf.writeDouble(snapshot.whiteRadius());
         buf.writeVarInt(Math.max(0, Math.min(65535, snapshot.remainingSeconds())));
         buf.writeDouble(snapshot.progress());
+        // [BR-ZONE-HUD 模块四] 圈外淘汰 TTK（秒）：客户端算"距被淘汰剩余秒数"用；
+        // 阶段零（还没开始掉血）服务端上报 0。
+        buf.writeDouble(snapshot.zoneTtkSeconds());
+        // [r198 协议 v3] 圈外每秒伤害 DPS（服务端按该玩家血量逐人算好）：
+        // 客户端倒计时 ceil(血量 / DPS) 每 tick 主动刷新，不再等血量真的掉。
+        buf.writeDouble(snapshot.damagePerSecond());
         return buf;
     }
 
@@ -136,7 +153,10 @@ public final class ZoneSync {
         double whiteRadius = buf.readDouble();
         int remainingSeconds = buf.readVarInt();
         double progress = buf.readDouble();
+        double zoneTtkSeconds = buf.readDouble();
+        double damagePerSecond = buf.readableBytes() >= 8 ? buf.readDouble() : 0.0;
         return new ZoneSnapshot(phase, stageIndex, mapId, dimensionId,
-                blueX, blueZ, blueRadius, whiteX, whiteZ, whiteRadius, remainingSeconds, progress);
+                blueX, blueZ, blueRadius, whiteX, whiteZ, whiteRadius,
+                remainingSeconds, progress, zoneTtkSeconds, damagePerSecond);
     }
 }

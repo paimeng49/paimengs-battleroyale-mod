@@ -38,6 +38,22 @@ public final class MapQueue {
         return playerToMap.get(playerId);
     }
 
+    /**
+     * [r149 DYNCAP 模块一] 容量预检（队长带队批量进图前调用）：
+     * 当前等待人数 + 即将加入人数 &gt; {@link GameMap#getMaxPlayers()} 时返回拒绝文案。
+     * 已在该图等待区的成员不重复占名额，incoming 只数「会新增占位的人」。
+     */
+    public String capacityError(GameMap map, int incoming) {
+        if (incoming <= 0) {
+            return null;
+        }
+        int max = map.getMaxPlayers();
+        if (waitingCount(map.mapId) + incoming > max) {
+            return "该地图已达人数上限（" + max + "人），请选择其他地图";
+        }
+        return null;
+    }
+
     /** 把玩家加入 mapId 的等待队列；失败返回错误文案，成功返回 null。 */
     public String join(UUID playerId, String mapId) {
         GameMap map = MapManager.INSTANCE.getMap(mapId);
@@ -48,10 +64,11 @@ public final class MapQueue {
         if (mapId.equals(current)) {
             return "你已在该地图等待中";
         }
-        int max = Math.max(1, map.maxPlayers);
+        // [r149 DYNCAP 模块一] 人数上限不再是写死的 100，而是 maxTeams × maxTeamSize 派生值。
+        int max = map.getMaxPlayers();
         Set<UUID> set = waiting.computeIfAbsent(mapId, ignored -> ConcurrentHashMap.newKeySet());
         if (set.size() >= max) {
-            return "该地图已满";
+            return "该地图已达人数上限（" + max + "人），请选择其他地图";
         }
         if (current != null) {
             leave(playerId);
