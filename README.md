@@ -73,7 +73,7 @@
 请在游玩或开服前前往原贴下载，并严格遵守原作者协议（CC BY 4.0）：
 
 - **Map**: Los Perrito City by **Uospag**
-- **Download**: [CurseForge Link](https://www.curseforge.com/minecraft/worlds/los-perrito-city)
+- **Download**: [CurseForge Link](https://www.curseforge.com/minecraft/worlds/los-perrito)
 - **License**: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 
 *(注：本项目仅提供地图适配配置文件与玩法逻辑，不含地图本体，请尊重原作者版权。)*
