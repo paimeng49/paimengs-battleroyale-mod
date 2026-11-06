@@ -1,4 +1,4 @@
-# 派蒙的大逃杀模组 (Paimon's Battle Royale)
+# 派蒙的大逃杀模组 (Paimeng's Battle Royale)
 
 > 一个基于 Minecraft **Fabric 1.20.1** 的大逃杀玩法基座，深度集成 **TACZ (Timeless & Classics Zero)** 枪械。
 > **代码 100% 由 AI 生成**，人类负责架构设计、玩法策划与实机排雷。
