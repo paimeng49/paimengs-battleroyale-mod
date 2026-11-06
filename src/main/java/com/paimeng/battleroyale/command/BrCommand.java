@@ -32,7 +32,6 @@ import com.paimeng.battleroyale.team.MatchTeamManager;
 import com.paimeng.battleroyale.team.Team;
 import com.paimeng.battleroyale.team.TeamManager;
 import com.paimeng.battleroyale.util.BrText;
-import com.paimeng.battleroyale.zone.ZoneManager;
 import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.CommandSourceStack;
@@ -50,7 +49,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * /paimengmods br join | leave | stop | setcenter | team ... 指令。
+ * /paimengmods br join | leave | stop | team ... 指令。
  *（开局不再由玩家侧 br start 触发：br join 进入等待后自动倒计时，
  * 管理员可用 /paimengmods manager start 强制开始。）
  *
@@ -58,7 +57,7 @@ import java.util.UUID;
  * 并在服务端一次性挂载，避免客户端命令树合并冲突。
  *
  * <p>本类只负责“校验 + 给指令执行者回话”，真正的状态变更全部委托给
- * {@link GameManager} / {@link ZoneManager} / {@link TeamManager}——
+ * {@link GameManager} / {@link TeamManager}——
  * 以后接入 GUI / 控制台时也能复用同一套入口。
  *
  * <p>升级预留：CommandManager / CommandSourceStack / EntityArgument 的包路径在
@@ -99,9 +98,6 @@ public final class BrCommand {
                                         .executes(ctx -> debugLoot(ctx.getSource())))
                                  .then(Commands.literal("tploot")
                                          .executes(ctx -> debugTeleportLoot(ctx.getSource()))))
-                        .then(Commands.literal("setcenter")
-                                .requires(src -> src.hasPermission(REQUIRED_OP_LEVEL))
-                                .executes(ctx -> setCenter(ctx.getSource())))
                         .then(Commands.literal("team")
                                 .then(Commands.literal("create")
                                         .executes(ctx -> teamCreate(ctx.getSource())))
@@ -575,48 +571,6 @@ public final class BrCommand {
     }
 
     /**
-     * /paimengmods br setcenter：把毒圈圆心设为执行者当前所在位置（X/Z 平面）。
-     *
-     * <p>[BR-ZONE] r109 起毒圈按维度独立：
-     * <ol>
-     *   <li>执行者所在维度正在跑圈 → 立刻挪那一圈（半径不变，超界自动夹回）；</li>
-     *   <li>同时把圆心写进该地图的 JSON（zoneCenterSet/zoneCenterX/Z），
-     *       下一局开圈直接以这里为初始蓝圈中心。</li>
-     * </ol>
-     */
-    private static int setCenter(CommandSourceStack source) {
-        ServerPlayer player = asPlayer(source);
-        if (player == null) {
-            return FAILURE;
-        }
-        net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> key =
-                player.level().dimension();
-        double x = player.getX();
-        double z = player.getZ();
-        StringBuilder hint = new StringBuilder();
-
-        // 1) 正在跑的圈（按维度路由）。
-        if (ZoneManager.INSTANCE.setCenterAt(key, x, z)) {
-            hint.append("（对局进行中，本维度蓝圈圆心已即时移动）");
-        }
-
-        // 2) 写进地图配置：只有游戏维度能反查到地图。
-        GameMap real = GameWorldManager.mapForWorld(key);
-        if (real != null) {
-            real.zoneCenterX = x;
-            real.zoneCenterZ = z;
-            real.zoneCenterSet = true;
-            MapManager.INSTANCE.saveMap(real);
-            hint.append("（已写入地图 ").append(real.mapId)
-                    .append(" 配置，下一局初始蓝圈以此为中心）");
-        } else if (hint.length() == 0) {
-            source.sendFailure(BrText.of("请在游戏维度里执行：主城 / 编辑副本没有可绑定的毒圈。"));
-            return FAILURE;
-        }
-        source.sendSuccess(() -> BrText.of(String.format("毒圈圆心已设为 (%.1f, %.1f)%s",
-                x, z, hint)), false);
-        return SUCCESS;
-    }
 
     /** 取执行者玩家；控制台执行时回错误并返回 null。 */
     private static ServerPlayer asPlayer(CommandSourceStack source) {

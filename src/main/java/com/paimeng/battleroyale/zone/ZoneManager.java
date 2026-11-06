@@ -174,15 +174,6 @@ public final class ZoneManager {
         return runtimes.values();
     }
 
-    /** /paimengmods br setcenter：把圆心设到执行者所在维度的那圈（无运行时返回 false，指令层落地图 JSON）。 */
-    public boolean setCenterAt(ResourceKey<Level> worldKey, double x, double z) {
-        ZoneRuntime zone = runtimeAt(worldKey);
-        if (zone == null) {
-            return false;
-        }
-        zone.setCenter(x, z);
-        return true;
-    }
 
     // ==================================================================
     // 每 tick 推进：由 ServerTickEvents.END_SERVER_TICK 驱动
@@ -279,8 +270,8 @@ public final class ZoneManager {
 
             // ---- [r130 阶段零] 初始蓝圈：罩住全图的超大圆，圆心 = 选区中心 ----
             // 需求：开局（跳伞落地）全图都在圈内，零圈外伤害；玩家只看得到白圈。
-            // setcenter 记录过圆心的仍然尊重（只挪超大圆的圆心，半径照样按"罩住这个
-            // 圆心所在选区的最远角 × 2"算，绝不会出现开局就有人被毒的情况）。
+            // 地图配置指定过圆心时仍然尊重（只挪超大圆的圆心，半径照样按“罩住这个
+            // 圆心所在选区的最远角 × 2”计算，绝不会出现开局就有人被毒的情况）。
             double cx = this.bounds.centerX();
             double cz = this.bounds.centerZ();
             if (map.zoneCenterSet) {
@@ -425,18 +416,6 @@ public final class ZoneManager {
         }
 
         // ----------------------------------------------------------------
-        // 设置
-        // ----------------------------------------------------------------
-
-        /** setcenter：把蓝圈圆心挪到指定点（半径不变；圆太大放不下就夹回选区内）。 */
-        public void setCenter(double x, double z) {
-            double loX = bounds.minX() + blueRadius;
-            double hiX = bounds.maxX() - blueRadius;
-            double loZ = bounds.minZ() + blueRadius;
-            double hiZ = bounds.maxZ() - blueRadius;
-            blueX = hiX < loX ? (bounds.minX() + bounds.maxX()) / 2.0 : clamp(x, loX, hiX);
-            blueZ = hiZ < loZ ? (bounds.minZ() + bounds.maxZ()) / 2.0 : clamp(z, loZ, hiZ);
-        }
 
         // ----------------------------------------------------------------
         // 每 tick 推进

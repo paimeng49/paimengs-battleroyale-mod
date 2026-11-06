@@ -189,6 +189,12 @@ public final class ClientZoneState {
     /**
      * 当前生效的圈外 DPS：优先用服务端逐玩家同步的 v3 字段；
      * 兼容兜底：旧口径下用 最大血量 / TTK 反推（服务端伤害模型同款公式）。
+     *
+     * <p>[r204 排查结论] 入参 {@code maxHealth} 必须是 1.20.1 的
+     * {@code LivingEntity#getMaxHealth()}——字节码验证它只读 MAX_HEALTH 属性、
+     * <b>不含金苹果吸收黄心</b>（黄心在独立的 absorptionAmount 字段）。
+     * 因此吃金苹果不会抬高 DPS，只会经 {@link ZoneTtkCountdown} 的增量补偿
+     * 推高基准血量、拉长倒计时——这正是"能多抗一会儿"的正确表现。
      */
     public static double effectiveDamagePerSecond(double maxHealth) {
         if (zoneDamagePerSecond > 0.0) {

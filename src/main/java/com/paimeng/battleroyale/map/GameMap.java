@@ -16,7 +16,7 @@ public class GameMap {
     public List<ManualLootSpawn> manualLootSpawns = new ArrayList<>();
     public double zoneCenterX;
     public double zoneCenterZ;
-    /** setcenter 是否指定过毒圈初始圆心（false = 用选区中心的最大内切圆）。 */
+    /** 是否指定过毒圈初始圆心（false = 使用选区中心）。 */
     public boolean zoneCenterSet = false;
     /**
      * 毒圈阶段配置（模块一）：每阶段的等待秒数 / 缩圈秒数 / 目标半径 / 圈外淘汰时间（秒）。

@@ -95,6 +95,9 @@ public final class ZoneSync {
         ZoneSnapshot snapshot = zone == null ? ZoneSnapshot.idle() : zone.snapshot();
         // [r198 协议 v3] 逐玩家注入圈外 DPS：与服务端 applyZoneDamage 的每秒步进同口径
         // （实际最大血量 / 本阶段 TTK）；phaseZero（还没开始掉血）时快照里 ttk=0，DPS 同步为 0。
+        // [r204 排查结论] 1.20.1 的 getMaxHealth() 只读 MAX_HEALTH 属性，不含金苹果吸收黄心
+        // （字节码验证：getstatic Attributes.MAX_HEALTH → getAttributeValue），
+        // 所以吃黄心不会改变本公式的 DPS——客户端据此做纯增量补偿。
         double dps = 0.0;
         if (zone != null && snapshot.zoneTtkSeconds() > 0.0) {
             dps = player.getMaxHealth() / snapshot.zoneTtkSeconds();
