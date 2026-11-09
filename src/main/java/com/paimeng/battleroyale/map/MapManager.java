@@ -31,6 +31,24 @@ public final class MapManager {
     public static final MapManager INSTANCE = new MapManager();
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
     private final Map<String, GameMap> maps = new LinkedHashMap<>();
+    /** [BR-COPY-SAFE] 单次复制最多打印多少条坏区块提示。 */
+    private static final int BAD_CHUNK_LOG_LIMIT = 20;
+
+    /**
+     * [BR-COPY-SAFE] 坏区块提示：同一次复制最多打印 {@value #BAD_CHUNK_LOG_LIMIT} 条，
+     * 其余只累计进 badChunks 汇总，绝不让一个坏 region 文件把日志刷满。
+     */
+    private static void noteBadChunk(String mapId, int chunkX, int chunkZ, String reason, int[] logged) {
+        if (logged[0] >= BAD_CHUNK_LOG_LIMIT) {
+            return;
+        }
+        logged[0]++;
+        BattleRoyaleMod.LOGGER.warn("[BR-COPY-SAFE] 地图 {} 区块 {},{} 数据损坏，复制时跳过：{}",
+                mapId, chunkX, chunkZ, reason);
+        if (logged[0] == BAD_CHUNK_LOG_LIMIT) {
+            BattleRoyaleMod.LOGGER.warn("[BR-COPY-SAFE] 地图 {} 后续坏区块不再逐条打印，最后统一汇总", mapId);
+        }
+    }
 
     private MapManager() {}
 
@@ -492,6 +510,8 @@ public final class MapManager {
         int copiedChunks = 0;
         int missingChunks = 0;
         int badChunks = 0;
+        /** [BR-COPY-SAFE] 本次复制已打印的坏区块提示条数（数组是为了在静态辅助方法里累加）。 */
+        final int[] badChunkLogged = new int[1];
         int intersectingFiles = 0;
         long intersectingBytes = 0;
         List<String> writtenFiles = new ArrayList<>();
@@ -518,12 +538,30 @@ public final class MapManager {
                     intersectingBytes += Files.size(source);
                     int writtenHere = 0;
                     RegionFile writer = null;
+                    // [BR-COPY-SAFE] 先体检：扇区表读不出来的 region 整片跳过，
+                    // 坏区块（region 被截断 / 外部 .mcc 缺失）按坏区块跳过，
+                    // 绝不让一个坏文件把整次重建带走，也不给原版刷 ERROR 的机会。
+                    RegionHealthProbe probe = null;
+                    try {
+                        probe = RegionHealthProbe.open(source);
+                    } catch (Throwable openError) {
+                        BattleRoyaleMod.LOGGER.warn("[BR-COPY-SAFE] 源 region 文件 {} 扇区表读不出来，整片跳过：{}",
+                                fileName, openError.toString());
+                        missingChunks += tileChunks;
+                        continue;
+                    }
                     try (RegionFile reader = new RegionFile(source, sourceRegion, false)) {
                         for (int cx = cxLo; cx <= cxHi; cx++) {
                             for (int cz = czLo; cz <= czHi; cz++) {
                                 ChunkPos pos = new ChunkPos(cx, cz);
                                 CompoundTag nbt;
                                 try {
+                                    String problem = probe.problem(cx, cz, sourceRegion);
+                                    if (problem != null) {
+                                        noteBadChunk(mapId, cx, cz, problem, badChunkLogged);
+                                        badChunks++;
+                                        continue;
+                                    }
                                     if (!reader.hasChunk(pos)) {
                                         missingChunks++;
                                         continue;
@@ -537,8 +575,7 @@ public final class MapManager {
                                     }
                                 } catch (IOException | RuntimeException e) {
                                     badChunks++;
-                                    BattleRoyaleMod.LOGGER.warn("[BR-COPY-DIAG] 区块 {} {} 读取失败，跳过：{}",
-                                            cx, cz, e.toString());
+                                    noteBadChunk(mapId, cx, cz, e.toString(), badChunkLogged);
                                     continue;
                                 }
                                 if (nbt == null) {
@@ -559,6 +596,11 @@ public final class MapManager {
                         if (writer != null) {
                             try { writer.flush(); } catch (java.io.IOException ignored) { }
                         }
+                    } catch (IOException | RuntimeException regionError) {
+                        // 单个源 region 文件级故障：整片跳过，不让它把整次重建带走。
+                        missingChunks += tileChunks;
+                        BattleRoyaleMod.LOGGER.warn("[BR-COPY-SAFE] 源 region 文件 {} 打开或读取失败，整片跳过（{} 个区块记为未复制）：{}",
+                                fileName, tileChunks, regionError.toString());
                     } finally {
                         if (writer != null) {
                             try {
@@ -566,6 +608,7 @@ public final class MapManager {
                             } catch (IOException ignored) {
                             }
                         }
+                        probe.close();
                     }
                     if (writtenHere > 0) {
                         writtenFiles.add(fileName + "（" + writtenHere + " 个区块）");

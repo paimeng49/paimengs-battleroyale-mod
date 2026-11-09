@@ -317,7 +317,8 @@ public final class MapColorGenerator {
             String diskDiag = "region 目录 " + disk.dimensionRegionDir
                     + "：回读成功 " + disk.loadedCount + "（其中经数据修复器升级 " + disk.dataFixedCount + "），"
                     + "文件缺失尝试 " + disk.fileMissingCount + "，区块表未命中 " + disk.chunkMissingCount
-                    + "，直接解析失败 " + disk.parseFailedCount + "，修复后仍失败 " + disk.dataFixFailedCount;
+                    + "，损坏区块跳过 " + disk.corruptChunkCount + "，直接解析失败 " + disk.parseFailedCount
+                    + "，修复后仍失败 " + disk.dataFixFailedCount;
             if (pixelsValid == 0) {
                 // 一个有效像素都没有 = 结果必然全黑，不发布；下次进图会自动重试，日志留证据。
                 BattleRoyaleMod.LOGGER.warn("[MapPreview] mapId={} 底图生成得到 0 个有效像素，本次结果不发布。诊断：{}；"
@@ -427,12 +428,24 @@ public final class MapColorGenerator {
         private final Map<Integer, Map<Long, DiskChunk>> rows = new LinkedHashMap<>();
         private final Map<Long, RegionFile> dimensionFiles = new HashMap<>();
         private final Map<Long, RegionFile> sourceFiles = new HashMap<>();
+        /** 区块体检器与 region 句柄同生命周期：先体检再交给原版读，坏区块不会触发原版 ERROR 刷屏。 */
+        private final Map<Long, RegionHealthProbe> dimensionProbes = new HashMap<>();
+        private final Map<Long, RegionHealthProbe> sourceProbes = new HashMap<>();
+        /** 连扇区表都读不出来的 region：整片跳过，只提示一次。 */
+        private final Set<Long> unreadableDimensionRegions = new java.util.HashSet<>();
+        private final Set<Long> unreadableSourceRegions = new java.util.HashSet<>();
         int loadedCount = 0;
         int fileMissingCount = 0;
         int chunkMissingCount = 0;
         int parseFailedCount = 0;
         int dataFixedCount = 0;
         int dataFixFailedCount = 0;
+        /** [BR-MINIMAP-SAFE] 跳过的损坏区块数（日志限频，汇总里给总数）。 */
+        int corruptChunkCount = 0;
+        private int corruptChunksLogged = 0;
+
+        /** 单条损坏区块提示的最多打印次数，超出后只数不打印。 */
+        private static final int CORRUPT_LOG_LIMIT = 20;
 
         DiskSource(MinecraftServer server, ServerLevel world, GameMap map) {
             this.dimensionRegionDir = GameWorldManager.regionDir(server, world.dimension());
@@ -485,11 +498,12 @@ public final class MapColorGenerator {
                 minZ = Math.min(minZ, Math.floorDiv(cz, 32));
                 maxZ = Math.max(maxZ, Math.floorDiv(cz, 32));
             }
-            pruneFiles(dimensionFiles, minZ, maxZ);
-            pruneFiles(sourceFiles, minZ, maxZ);
+            pruneCache(dimensionFiles, dimensionProbes, minZ, maxZ);
+            pruneCache(sourceFiles, sourceProbes, minZ, maxZ);
         }
 
-        private static void pruneFiles(Map<Long, RegionFile> files, int minZ, int maxZ) {
+        private static void pruneCache(Map<Long, RegionFile> files, Map<Long, RegionHealthProbe> probes,
+                                       int minZ, int maxZ) {
             Iterator<Map.Entry<Long, RegionFile>> it = files.entrySet().iterator();
             while (it.hasNext()) {
                 Map.Entry<Long, RegionFile> entry = it.next();
@@ -502,22 +516,61 @@ public final class MapColorGenerator {
                     }
                 }
             }
+            Iterator<Map.Entry<Long, RegionHealthProbe>> pit = probes.entrySet().iterator();
+            while (pit.hasNext()) {
+                Map.Entry<Long, RegionHealthProbe> entry = pit.next();
+                int rz = (int) (long) entry.getKey();
+                if (rz < minZ || rz > maxZ) {
+                    pit.remove();
+                    entry.getValue().close();
+                }
+            }
         }
 
-        /** 参考 r72 copySelectedChunks：RegionFile 打开 .mca → hasChunk → getChunkInputStream → NbtIo.read。 */
+        /**
+         * 参考 r72 copySelectedChunks：RegionFile 打开 .mca → hasChunk → getChunkInputStream → NbtIo.read。
+         *
+         * <p>[BR-MINIMAP-SAFE] 读任何区块数据前先过 {@link RegionHealthProbe} 体检：
+         * 扇区越界、region 被截断、外部 {@code .mcc} 缺失的坏区块直接按“未生成”跳过，
+         * 既不会让原版 RegionFile 自己刷 {@code stream is truncated} / {@code is not file} 的 ERROR，
+         * 也不会中断整轮扫描；同一 region 文件读取彻底失败只提示一次，之后整片跳过。
+         */
         private DiskChunk readChunk(Path regionDir, int chunkX, int chunkZ) {
             int rx = Math.floorDiv(chunkX, 32);
             int rz = Math.floorDiv(chunkZ, 32);
             long fileKey = ChunkPos.asLong(rx, rz);
-            Map<Long, RegionFile> files = regionDir.equals(dimensionRegionDir) ? dimensionFiles : sourceFiles;
+            boolean fromDimension = regionDir.equals(dimensionRegionDir);
+            Map<Long, RegionFile> files = fromDimension ? dimensionFiles : sourceFiles;
+            Map<Long, RegionHealthProbe> probes = fromDimension ? dimensionProbes : sourceProbes;
+            Set<Long> unreadable = fromDimension ? unreadableDimensionRegions : unreadableSourceRegions;
+            Path file = regionDir.resolve("r." + rx + "." + rz + ".mca");
             try {
-                RegionFile region = files.get(fileKey);
-                Path file = regionDir.resolve("r." + rx + "." + rz + ".mca");
-                if (region == null) {
+                if (unreadable.contains(fileKey)) {
+                    return null;
+                }
+                RegionHealthProbe probe = probes.get(fileKey);
+                if (probe == null) {
                     if (!Files.isRegularFile(file)) {
                         fileMissingCount++;
                         return null;
                     }
+                    try {
+                        probe = RegionHealthProbe.open(file);
+                        probes.put(fileKey, probe);
+                    } catch (Throwable openError) {
+                        unreadable.add(fileKey);
+                        BattleRoyaleMod.LOGGER.warn("[BR-MINIMAP-SAFE] region 文件 {} 扇区表读不出来，整片跳过：{}",
+                                file.getFileName(), openError.toString());
+                        return null;
+                    }
+                }
+                String problem = probe.problem(chunkX, chunkZ, regionDir);
+                if (problem != null) {
+                    noteCorruptChunk(chunkX, chunkZ, problem);
+                    return null;
+                }
+                RegionFile region = files.get(fileKey);
+                if (region == null) {
                     region = new RegionFile(file, regionDir, false);
                     files.put(fileKey, region);
                 }
@@ -554,8 +607,8 @@ public final class MapColorGenerator {
                     return parsed;
                 }
             } catch (Throwable t) {
-                BattleRoyaleMod.LOGGER.warn("[BR-MINIMAP-FIX] 磁盘区块 {} {} 读取失败，按未生成处理：{}",
-                        chunkX, chunkZ, t.toString());
+                // 只丢掉出问题的那一个区块（提示限频），坏句柄换掉、体检通道保留，整轮扫描继续。
+                noteCorruptChunk(chunkX, chunkZ, t.toString());
                 RegionFile failed = files.remove(fileKey);
                 if (failed != null) {
                     try {
@@ -567,11 +620,35 @@ public final class MapColorGenerator {
             }
         }
 
+        /** 坏区块限频提示：最多 {@value #CORRUPT_LOG_LIMIT} 条，之后只累计计数，扫描照常继续。 */
+        private void noteCorruptChunk(int chunkX, int chunkZ, String reason) {
+            corruptChunkCount++;
+            if (corruptChunksLogged < CORRUPT_LOG_LIMIT) {
+                corruptChunksLogged++;
+                BattleRoyaleMod.LOGGER.warn("[BR-MINIMAP-SAFE] 区块 {},{} 数据损坏，跳过（{}）",
+                        chunkX, chunkZ, reason);
+                if (corruptChunksLogged == CORRUPT_LOG_LIMIT) {
+                    BattleRoyaleMod.LOGGER.warn("[BR-MINIMAP-SAFE] 后续损坏区块不再逐条打印，最后统一汇总条数");
+                }
+            }
+        }
+
         @Override
         public void close() {
             rows.clear();
             closeFiles(dimensionFiles);
             closeFiles(sourceFiles);
+            closeProbes(dimensionProbes);
+            closeProbes(sourceProbes);
+            unreadableDimensionRegions.clear();
+            unreadableSourceRegions.clear();
+        }
+
+        private static void closeProbes(Map<Long, RegionHealthProbe> probes) {
+            for (RegionHealthProbe probe : probes.values()) {
+                probe.close();
+            }
+            probes.clear();
         }
 
         private static void closeFiles(Map<Long, RegionFile> files) {

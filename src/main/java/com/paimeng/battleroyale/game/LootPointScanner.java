@@ -4,6 +4,7 @@ import com.mojang.datafixers.DataFixer;
 import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.map.GameMap;
 import com.paimeng.battleroyale.map.GameWorldManager;
+import com.paimeng.battleroyale.map.RegionHealthProbe;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
@@ -26,6 +27,7 @@ import net.minecraft.world.level.chunk.storage.RegionFile;
 import java.io.DataInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -77,6 +79,8 @@ public final class LootPointScanner {
     private static final int GRID_CACHE = 12;
     /** region 文件句柄 LRU 上限。 */
     private static final int REGION_CACHE = 6;
+    /** [BR-LOOT-SCAN-SAFE] 坏区块提示上限（条）：超出后只计数不打印，绝不刷屏。 */
+    private static final int CORRUPT_LOG_LIMIT = 20;
     /** 选区单边宽度上限：坐标编码位宽 21 bit，超过即放弃扫描（不可能出现的地图尺寸）。 */
     private static final int MAX_SPAN = 1 << 21;
 
@@ -186,13 +190,15 @@ public final class LootPointScanner {
         } catch (Throwable t) {
             scan.error = t.toString();
             BattleRoyaleMod.LOGGER.warn("[BR-LOOT-SCAN] 地图 {} 刷新点库扫描异常：{}", scan.mapId, t.toString());
+        } finally {
+            scan.closeCaches();
         }
         scan.done = true;
         scan.ms = System.currentTimeMillis() - t0;
         if (!scan.cancelled.get()) {
-            BattleRoyaleMod.LOGGER.info("[BR-LOOT-SCAN] 地图 {} 刷新点库扫描完成：区块 {} 个（磁盘缺失 {}），"
+            BattleRoyaleMod.LOGGER.info("[BR-LOOT-SCAN] 地图 {} 刷新点库扫描完成：区块 {} 个（磁盘缺失 {}，损坏跳过 {}），"
                             + "封闭室内 {} 间，开放空间 {} 处，合法刷新点 {} 个，耗时 {} 秒",
-                    scan.mapId, scan.chunksScanned, scan.chunksMissing,
+                    scan.mapId, scan.chunksScanned, scan.chunksMissing, scan.chunksCorrupt,
                     scan.roomsIndoor, scan.roomsOpen, scan.produced.get(), scan.ms / 1000.0);
         }
     }
@@ -338,6 +344,23 @@ public final class LootPointScanner {
                 return false;
             }
         };
+        /** 损坏区块负缓存：每个区块只跳过并提示一次，避免扫描中断或日志刷屏。 */
+        final HashSet<Long> skippedCorruptChunks = new HashSet<>();
+        /** 区块体检器与 region 句柄同步淘汰。 */
+        final LinkedHashMap<Long, RegionHealthProbe> probes = new LinkedHashMap<>(8, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, RegionHealthProbe> eldest) {
+                if (size() > REGION_CACHE) {
+                    eldest.getValue().close();
+                    return true;
+                }
+                return false;
+            }
+        };
+        /** 连扇区表都读不出来的 region：整片跳过，只提示一次。 */
+        final HashSet<Long> unreadableRegions = new HashSet<>();
+        /** 损坏区块限频提示已打印条数。 */
+        int corruptLogged;
         /** 全局已扩散格（防同一开放空间被不同候选点反复撑满上限）。 */
         final LongOpenHashSet visited = new LongOpenHashSet(1 << 16);
         final ConcurrentLinkedQueue<BlockPos> pending = new ConcurrentLinkedQueue<>();
@@ -348,6 +371,8 @@ public final class LootPointScanner {
         volatile long ms;
         volatile int chunksScanned;
         volatile int chunksMissing;
+        /** [BR-LOOT-SCAN-SAFE] 体检判定为损坏、按空气跳过的区块数。 */
+        volatile int chunksCorrupt;
         volatile int roomsIndoor;
         volatile int roomsOpen;
 
@@ -367,6 +392,22 @@ public final class LootPointScanner {
 
         boolean finished() {
             return done || cancelled.get();
+        }
+
+        /** 扫描收尾：关掉还开着的 region 句柄与体检通道（缓存本身随任务对象一起丢弃）。 */
+        void closeCaches() {
+            for (RegionFile region : regions.values()) {
+                try {
+                    region.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            regions.clear();
+            for (RegionHealthProbe probe : probes.values()) {
+                probe.close();
+            }
+            probes.clear();
+            grids.clear();
         }
 
         // ---------------- 坐标打包（原版 BlockPos.asLong 同口径：26+26+12 位有符号） ----------------
@@ -440,32 +481,61 @@ public final class LootPointScanner {
             return grid;
         }
 
-        /** 从 .mca 直读区块并解码三色网格；磁盘没有返回 null（按全空气处理）。 */
+        /**
+         * 从 .mca 直读区块并解码三色网格；磁盘没有 / 数据损坏返回 null（按全空气处理）。
+         *
+         * <p>[BR-LOOT-SCAN-SAFE] 先用 {@link RegionHealthProbe} 体检：region 被截断、扇区越界、
+         * 外部 {@code .mcc} 缺失的坏区块直接跳过，既不会被原版 RegionFile 打成
+         * {@code stream is truncated} / {@code is not file} 的 ERROR 刷屏，也不会中断整轮扫描。
+         * 同一 region 彻底读不动时只提示一次，之后整片按空气跳过。
+         */
         private byte[] loadGrid(int chunkX, int chunkZ) {
             int rx = Math.floorDiv(chunkX, 32);
             int rz = Math.floorDiv(chunkZ, 32);
             long fk = ChunkPos.asLong(rx, rz);
+            Path file = regionDir.resolve("r." + rx + "." + rz + ".mca");
+            ChunkPos pos = new ChunkPos(chunkX, chunkZ);
+            if (unreadableRegions.contains(fk)) {
+                return null;
+            }
             try {
-                RegionFile region = regions.get(fk);
-                if (region == null) {
-                    Path file = regionDir.resolve("r." + rx + "." + rz + ".mca");
+                RegionHealthProbe probe = probes.get(fk);
+                if (probe == null) {
                     if (!Files.isRegularFile(file)) {
-                        regions.remove(fk);
                         return null;
                     }
+                    try {
+                        probe = RegionHealthProbe.open(file);
+                        probes.put(fk, probe);
+                    } catch (Throwable openError) {
+                        unreadableRegions.add(fk);
+                        BattleRoyaleMod.LOGGER.warn("[BR-LOOT-SCAN-SAFE] 地图 {} 的 region {} 扇区表读不出来，整片跳过：{}",
+                                mapId, file.getFileName(), openError.toString());
+                        return null;
+                    }
+                }
+                String problem = probe.problem(chunkX, chunkZ, regionDir);
+                if (problem != null) {
+                    skipCorruptChunk(pos, problem);
+                    return null;
+                }
+                RegionFile region = regions.get(fk);
+                if (region == null) {
                     region = new RegionFile(file, regionDir, false);
                     regions.put(fk, region);
                 }
-                ChunkPos pos = new ChunkPos(chunkX, chunkZ);
                 if (!region.hasChunk(pos)) {
                     return null;
                 }
                 CompoundTag root;
                 try (DataInputStream in = region.getChunkDataInputStream(pos)) {
                     if (in == null) {
-                        return null;
+                        return null; // 体检已放行：这里为空只是该区块确实没有数据流
                     }
                     root = NbtIo.read(in);
+                } catch (Throwable t) {
+                    skipCorruptChunk(pos, t.toString());
+                    return null;
                 }
                 if (root == null) {
                     return null;
@@ -475,13 +545,41 @@ public final class LootPointScanner {
                     try {
                         root = DataFixTypes.CHUNK.updateToCurrentVersion(fixer, root, version);
                     } catch (Throwable t) {
+                        skipCorruptChunk(pos, "数据修复失败 " + t);
                         return null; // 修不动就当没有，整块按空气
                     }
                 }
                 return decodeGrid(root);
             } catch (Throwable t) {
-                // 单区块读失败不影响整图：按空气跳过（下局复制完成后自然修正）。
+                // 单区块读失败不影响整图：按空气跳过这一个区块（下局复制完成后自然修正），
+                // 坏句柄换新，体检通道与整片 region 都继续用。
+                skipCorruptChunk(pos, t.toString());
+                RegionFile failed = regions.remove(fk);
+                if (failed != null) {
+                    try {
+                        failed.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
                 return null;
+            }
+        }
+
+        /** 坏区块提示：同一区块只提示一次，最多 {@value #CORRUPT_LOG_LIMIT} 条，其余只累计不打印。 */
+        private void skipCorruptChunk(ChunkPos pos, String reason) {
+            if (!skippedCorruptChunks.add(ChunkPos.asLong(pos.x, pos.z))) {
+                return;
+            }
+            chunksCorrupt++;
+            if (corruptLogged >= CORRUPT_LOG_LIMIT) {
+                return;
+            }
+            corruptLogged++;
+            BattleRoyaleMod.LOGGER.warn("[BR-LOOT-SCAN-SAFE] 地图 {} 区块 {},{} 数据损坏，按空气跳过：{}",
+                    mapId, pos.x, pos.z, reason);
+            if (corruptLogged == CORRUPT_LOG_LIMIT) {
+                BattleRoyaleMod.LOGGER.warn("[BR-LOOT-SCAN-SAFE] 地图 {} 后续损坏区块不再逐条打印，扫描继续",
+                        mapId);
             }
         }
 

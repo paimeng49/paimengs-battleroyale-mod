@@ -10,8 +10,8 @@ import java.util.UUID;
 /**
  * [BR-MINIMAP] 队友坐标缓存（只读）：本队全员的世界 X/Z + 座号 + 存活状态。
  *
- * <p>数据来源：服务端 {@code TeammatePosSync} 每 5 tick 的定向快照
- * （battleroyale:teammate_pos 通道——包体很小，按 250ms 线性插值补足平滑）。
+ * <p>数据来源：服务端 {@code TeammatePosSync} 每 10 tick 的定向快照
+ * （battleroyale:teammate_pos 通道——包体很小，按 500ms 线性插值补足平滑）。
  * 消费方：{@link MapRenderer} 的小地图 / 全屏地图队友图标层。
  *
  * <p>为什么用服务端坐标而不是查 {@code client.level.getPlayerByUUID}：
@@ -24,8 +24,8 @@ import java.util.UUID;
  */
 public final class ClientTeammatePosState {
 
-    /** 服务端包间隔（毫秒）：0.25 秒，插值窗口按它取。 */
-    private static final long PACKET_INTERVAL_MILLIS = 250L;
+    /** 服务端包间隔（毫秒）：0.5 秒，插值窗口按它取。 */
+    private static final long PACKET_INTERVAL_MILLIS = 500L;
 
     /** 一条队友坐标：上一份 (prev) → 当前份 (x/z)，到达时刻用于插值。 */
     public record Entry(int seat, double prevX, double prevZ,
@@ -95,6 +95,11 @@ public final class ClientTeammatePosState {
             }
             hadData = hasData;
         }
+    }
+
+    /** 判断某个玩家是否出现在服务端定向下发的“我的队伍”坐标表中。 */
+    public static boolean contains(UUID playerId) {
+        return playerId != null && byPlayer.containsKey(playerId);
     }
 
     /** 断线 / 退出世界 / 本局销毁：图标全部消失。 */

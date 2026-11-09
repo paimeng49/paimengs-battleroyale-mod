@@ -4,6 +4,7 @@ import com.paimeng.battleroyale.BattleRoyaleMod;
 import com.paimeng.battleroyale.event.GameStateChangedEvent;
 import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.team.MatchTeamManager;
+import com.paimeng.battleroyale.util.BrText;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerBossEvent;
@@ -21,7 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class MatchResetManager {
 
     public static final MatchResetManager INSTANCE = new MatchResetManager();
-    public static final int RESET_DELAY_TICKS = 5 * GameRules.TICKS_PER_SECOND;
+    /** 吃鸡后 8 秒结算倒计时，结束后进入地图安全重置。 */
+    public static final int RESET_DELAY_TICKS = GameRules.ENDED_RESET_TICKS;
     private static final int DELETE_BATCH_SIZE = 10;
     private static final int COMPLETE_DISPLAY_TICKS = 3 * GameRules.TICKS_PER_SECOND;
 
@@ -58,6 +60,11 @@ public final class MatchResetManager {
         }
         if (ticksLeft >= 0) {
             if (ticksLeft > 0) {
+                // 每 2 秒播报一次：8、6、4、2 秒后重置并返回大厅。
+                if (ticksLeft % (2 * GameRules.TICKS_PER_SECOND) == 0) {
+                    int secondsLeft = ticksLeft / GameRules.TICKS_PER_SECOND;
+                    BrText.broadcast(server, "服务器将在 " + secondsLeft + " 秒后重置并返回大厅...");
+                }
                 ticksLeft--;
             } else {
                 ticksLeft = -1;
@@ -83,7 +90,7 @@ public final class MatchResetManager {
         }
         resetStarted = true;
         createBossBar(server);
-        BattleRoyaleMod.LOGGER.info("[BR-RESET] 开始卸载游戏维度并准备异步删除 .mca 文件");
+        BattleRoyaleMod.LOGGER.info("[BR-RESET] 开始卸载游戏维度并准备异步删除区块文件（.mca/.mcc）");
 
         try {
             List<ServerPlayer> snapshot = new ArrayList<>(server.getPlayerList().getPlayers());
@@ -116,21 +123,39 @@ public final class MatchResetManager {
         }
         int total = files.size();
         AtomicInteger deleted = new AtomicInteger();
+        AtomicInteger failed = new AtomicInteger();
         GameWorldManager.runWorldIo(() -> {
             for (int start = 0; start < files.size(); start += DELETE_BATCH_SIZE) {
                 int end = Math.min(start + DELETE_BATCH_SIZE, files.size());
                 for (int i = start; i < end; i++) {
+                    Path path = files.get(i);
                     try {
-                        Files.deleteIfExists(files.get(i));
+                        boolean removed = Files.deleteIfExists(path);
+                        if (removed) {
+                            deleted.incrementAndGet();
+                            BattleRoyaleMod.LOGGER.info("[BR-RESET] 已删除区块文件：{}", path);
+                        } else {
+                            failed.incrementAndGet();
+                            BattleRoyaleMod.LOGGER.warn("[BR-RESET] 区块文件不存在或未删除：{}", path);
+                        }
                     } catch (IOException e) {
-                        BattleRoyaleMod.LOGGER.warn("[BR-RESET] 删除文件失败：{}，{}", files.get(i), e.toString());
+                        failed.incrementAndGet();
+                        BattleRoyaleMod.LOGGER.error("[BR-RESET] 删除区块文件时发生 IOException：{}", path, e);
                     }
-                    deleted.incrementAndGet();
                 }
                 int count = deleted.get();
                 server.execute(() -> updateProgress(server, count, total));
             }
-            server.execute(() -> completeReset(server, deleted.get(), total));
+            server.execute(() -> {
+                List<Path> leftovers = GameWorldManager.collectMatchMcaFiles(server);
+                if (!leftovers.isEmpty()) {
+                    BattleRoyaleMod.LOGGER.error("[BR-RESET] 删除完成后仍有 {} 个区块文件（.mca/.mcc）残留：{}",
+                            leftovers.size(), leftovers);
+                }
+                BattleRoyaleMod.LOGGER.info("[BR-RESET] 删除汇总：成功 {}，失败/不存在 {}，总数 {}", 
+                        deleted.get(), failed.get(), total);
+                completeReset(server, deleted.get(), total);
+            });
         });
     }
 
@@ -159,7 +184,7 @@ public final class MatchResetManager {
             bossBar.setName(Component.literal("地图重置完成，可以开始下一局！"));
         }
         completeTicksLeft = COMPLETE_DISPLAY_TICKS;
-        BattleRoyaleMod.LOGGER.info("[BR-RESET] 地图文件清理完成：删除 {}/{} 个 .mca 文件", deleted, total);
+        BattleRoyaleMod.LOGGER.info("[BR-RESET] 地图文件清理完成：删除 {}/{} 个区块文件（.mca/.mcc）", deleted, total);
     }
 
     private void finishResetWithError(MinecraftServer server) {

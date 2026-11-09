@@ -858,6 +858,13 @@ public final class GameWorldManager {
         if (server == null) {
             return;
         }
+        // 在摘除 ServerLevel 前保存全服区块，避免异步删除时仍有脏数据或文件句柄。
+        try {
+            boolean saved = server.saveAllChunks(false, true, false);
+            BattleRoyaleMod.LOGGER.info("[BR-RESET] saveAllChunks(false, true, false) 完成：{}", saved);
+        } catch (Throwable t) {
+            BattleRoyaleMod.LOGGER.error("[BR-RESET] saveAllChunks 失败，将继续卸载并记录删除结果", t);
+        }
         MinecraftServerAccessor access = (MinecraftServerAccessor) server;
         List<ResourceKey<Level>> keys = new ArrayList<>();
         for (ResourceKey<Level> key : access.battleroyale$getWorlds().keySet()) {
@@ -926,7 +933,7 @@ public final class GameWorldManager {
         com.paimeng.battleroyale.game.AirdropManager.clearTracking();
     }
 
-    /** 收集所有游戏维度 region / entities 目录下的 .mca 文件，供重置线程删除。 */
+    /** 收集所有游戏维度 region / entities 目录下的区块数据文件（.mca 与外部区块流 .mcc），供重置线程删除。 */
     public static List<Path> collectMatchMcaFiles(MinecraftServer server) {
         List<Path> files = new ArrayList<>();
         if (server == null) {
@@ -938,7 +945,12 @@ public final class GameWorldManager {
         }
         try (Stream<Path> paths = Files.walk(root)) {
             paths.filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString().endsWith(".mca"))
+                    .filter(path -> {
+                        String name = path.getFileName().toString();
+                        // .mcc 是 1.18.2 的外部区块流文件：只清 .mca 会留下孤儿 .mcc，
+                        // 下一局读区块时就会出现 "c.x.z.mcc is not file" 那类报错。
+                        return name.endsWith(".mca") || name.endsWith(".mcc");
+                    })
                     .filter(path -> {
                         Path parent = path.getParent();
                         String name = parent == null ? "" : parent.getFileName().toString();
@@ -946,7 +958,7 @@ public final class GameWorldManager {
                     })
                     .forEach(files::add);
         } catch (IOException e) {
-            BattleRoyaleMod.LOGGER.warn("[BR-RESET] 扫描游戏维度 .mca 文件失败：{}", e.toString());
+            BattleRoyaleMod.LOGGER.warn("[BR-RESET] 扫描游戏维度区块文件失败：{}", e.toString());
         }
         return files;
     }

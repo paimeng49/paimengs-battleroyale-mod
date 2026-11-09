@@ -19,14 +19,14 @@ import java.util.UUID;
 /**
  * [BR-MINIMAP] 队友坐标 S2C 通道（battleroyale:teammate_pos）。
  *
- * <p>挂在 {@code ServerTickEvents.END_SERVER_TICK} 上的 {@link #tick} 每 5 tick
- * （0.25 秒）给<b>每支 MatchTeam 的每名在线成员</b>定向发一份本队全员快照
+ * <p>挂在 {@code ServerTickEvents.END_SERVER_TICK} 上的 {@link #tick} 每 10 tick
+ * （0.5 秒）给<b>每支 MatchTeam 的每名在线成员</b>定向发一份本队全员快照
  * （含观战中的已淘汰成员，需求：观战时小地图继续显示存活队友图标）。
  * 只在 FLIGHT / RUNNING 阶段发送；阶段离开后补发一次空包把客户端清干净，
  * 之后静默零开销（未开局时不遍历不发包）。
  *
- * <p>量级：≤4 人/队 × ~40B/人 ≈ 每队 160B，每 0.25 秒一份，只发给本队——
- * 全场 25 队也不过每秒 ~16KB，可忽略。客户端按 250ms 线性插值平滑移动。
+ * <p>量级：≤4 人/队 × ~40B/人 ≈ 每队 160B，每 0.5 秒一份，只发给本队——
+ * 全场 25 队也不过每秒 ~8KB，可忽略。客户端按 500ms 线性插值平滑移动。
  *
  * <p>包体格式（两边字段顺序必须一模一样）：
  * <pre>
@@ -39,8 +39,8 @@ public final class TeammatePosSync {
     public static final ResourceLocation CHANNEL_ID =
             new ResourceLocation(BattleRoyaleMod.MOD_ID, "teammate_pos");
 
-    /** 发送间隔（tick）：0.25 秒，客户端侧线性插值补足平滑。 */
-    private static final int SEND_INTERVAL_TICKS = 5;
+    /** 发送间隔（tick）：0.5 秒，客户端侧线性插值补足平滑。 */
+    private static final int SEND_INTERVAL_TICKS = 10;
 
     /** 心跳日志间隔（tick）：每 5 秒确认一次“包还在发”（实机排障用，[r143]）。 */
     private static final int HEARTBEAT_LOG_TICKS = 100;
@@ -137,7 +137,9 @@ public final class TeammatePosSync {
             return;
         }
         if (ServerPlayNetworking.canSend(player, CHANNEL_ID)) {
-            ServerPlayNetworking.send(player, CHANNEL_ID, encode(payload));
+            FriendlyByteBuf encoded = encode(payload);
+            NetworkTrafficMonitor.record(encoded);
+            ServerPlayNetworking.send(player, CHANNEL_ID, encoded);
         }
     }
 

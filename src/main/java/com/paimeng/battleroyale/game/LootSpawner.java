@@ -40,7 +40,7 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * [BR-LOOT 模块二] 普通物资刷新引擎（合法刷新点库 + 开局全图预铺）。
  *
- * <p>进入 PREPARING 时把选区交给 {@link LootPointScanner} 后台异步扫描（直读游戏维度磁盘
+ * <p>进入 FLIGHT 时把选区交给 {@link LootPointScanner} 后台异步扫描（直读游戏维度磁盘
  * .mca，不阻塞主线程），找出空气净空、实体地板且上方有屋顶遮挡的室内坐标。扫描结果每 tick
  * 汇入主线程点库；每个坐标取出即消费，服务端主动强制加载目标区块并放置箱子。
  *
@@ -48,10 +48,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * 通过后生成原版箱子，从 {@link GameMap#lootPool} 洗牌抽取 {@value #MIN_GROUPS}~{@value #MAX_GROUPS}
  * 个互不重复的物资组放入。随机撒点路径不再参与实际生成，避免“玩家走到哪才刷到哪”。
  *
- * <p>数量控制：进入 PREPARING 后持续从扫描点库预铺，直到达到 {@link GameMap#maxLootBoxes}；
+ * <p>数量控制：进入 FLIGHT 后持续从扫描点库预铺，直到达到 {@link GameMap#maxLootBoxes}；
  * 每 tick 最多处理一小批，几十秒内完成全图铺设。扫描线程只读地图文件，所有区块加载和箱子放置都在服务端主线程完成。
  *
- * <p>生命周期：随 PREPARING 启动并贯穿 FLIGHT / RUNNING，离开本局活动阶段后停止（主类订阅 GameStateChangedEvent 接线）；
+ * <p>生命周期：随 FLIGHT 启动并贯穿 RUNNING，离开本局活动阶段后停止（主类订阅 GameStateChangedEvent 接线）；
  * 安全重置（{@link MatchResetManager} → {@code GameWorldManager.unloadMatchWorlds}）
  * 前调用 {@link #clearLootChests} 按台账清掉本局刷出的所有箱子与坐标记录。
  *
@@ -63,7 +63,7 @@ public final class LootSpawner {
     public static final LootSpawner INSTANCE = new LootSpawner();
 
     /** 每个服务端 tick 最多预铺的箱子数；世界改动始终在主线程完成。 */
-    public static final int PRELOAD_BATCH_PER_TICK = 8;
+    public static final int PRELOAD_BATCH_PER_TICK = 3;
     /** 仅供旧诊断日志换算时间，不再作为生成定时器。 */
     public static final int SPAWN_INTERVAL_TICKS = 40;
     /** 仅保留给旧诊断常量，开局预铺不再使用随机概率撒点。 */
@@ -103,8 +103,8 @@ public final class LootSpawner {
     private static final int DIAG_SPAWNED = 6;  // 成功刷出
     private static final int DIAG_ERROR = 7;    // 抛异常（照实记录，不再静默）
     private static final int DIAG_REASONS = 8;
-    /** 诊断汇总周期：每 15 轮（30 秒）打一条 [BR-LOOT-DIAG] 日志。 */
-    private static final int DIAG_REPORT_ROUNDS = 15;
+    /** 诊断汇总周期：每 600 tick（30 秒）打一条 [BR-LOOT-DIAG] 日志（预铺改为逐 tick 消费后，按 tick 计轮数）。 */
+    private static final int DIAG_REPORT_ROUNDS = 600;
     /** 诊断计数：每轮固定尝试 50 个候选点，其中只有命中 10% 的点才进入建筑判定。 */
     private static final int DIAG_ATTEMPTED = 8;
     private static final int DIAG_TOTAL_REASONS = 9;
@@ -138,7 +138,24 @@ public final class LootSpawner {
     // 生命周期
     // ==================================================================
 
-    /** 进入 PREPARING：给每个有对局玩家的游戏维度建立预铺运行时，并启动后台点库扫描。 */
+    /**
+     * 进入 PREPARING 时执行的清场步骤：取消旧扫描、丢弃旧运行时和台账。
+     * <p>这里绝不能启动扫描或生成；物资生命周期严格从 FLIGHT 开始。
+     */
+    public void prepareForNewMatch(MinecraftServer server) {
+        stop(server);
+        if (server != null) {
+            for (ServerLevel world : server.getAllLevels()) {
+                if (GameWorldManager.isGameWorld(world.dimension())) {
+                    clearLootChests(world);
+                }
+            }
+        }
+        PLACED_CHESTS.clear();
+        BattleRoyaleMod.LOGGER.info("[BR-LOOT] PREPARING 清场完成：准备阶段不生成物资箱");
+    }
+
+    /** 进入 FLIGHT：给每个有对局玩家的游戏维度建立预铺运行时，并启动后台点库扫描。 */
     public void start(MinecraftServer server) {
         stop(server);
         if (server == null) {
@@ -171,17 +188,21 @@ public final class LootSpawner {
             }
             runtimes.put(key, runtime);
             PLACED_CHESTS.put(key, new ArrayList<>());
-            BattleRoyaleMod.LOGGER.info("[BR-LOOT] 地图 {} 物资预铺启动：使用 {} 个物资组，目标 {} 箱（物资池配置：{}）",
-                    map.mapId, runtime.pool.size(), runtime.cap,
+            BattleRoyaleMod.LOGGER.info("[BR-LOOT] 地图 {} 物资预铺启动：使用 {} 个物资组，目标 {} 箱"
+                            + "（每 tick 最多 {} 箱，约 {} 秒铺完；物资池配置：{}）",
+                    map.mapId, runtime.pool.size(), runtime.cap, PRELOAD_BATCH_PER_TICK,
+                    Math.max(1, (int) Math.ceil(runtime.cap / (double) PRELOAD_BATCH_PER_TICK) / 20),
                     runtime.poolConfig.isEmpty() ? "内置默认池" : runtime.poolConfig);
             // 后台异步扫描选区建立合法刷新点库（读磁盘 .mca，绝不占主线程）。
             LootPointScanner.INSTANCE.begin(world, map);
         }
         if (runtimes.isEmpty()) {
-            BattleRoyaleMod.LOGGER.warn("[BR-LOOT] PREPARING 已开启但没有任何游戏维度进入全图预铺"
+            BattleRoyaleMod.LOGGER.warn("[BR-LOOT] FLIGHT 已开启但没有任何游戏维度进入全图预铺"
                     + "（没有参赛者在游戏维度，或维度未映射到地图）");
         } else {
-            BattleRoyaleMod.LOGGER.info("[BR-LOOT] PREPARING 已启动全图预铺：扫描点库就绪后由服务端主线程每 tick 强制加载区块并批量放置，直至铺满各地图上限");
+            BattleRoyaleMod.LOGGER.info("[BR-LOOT] FLIGHT 已启动全图预铺：生成队列由服务端逐 tick 消费，"
+                    + "每 tick 最多处理 {} 个点位（强制加载区块 + 放箱），绝不在单 tick 内死循环铺满全图",
+                    PRELOAD_BATCH_PER_TICK);
         }
     }
 
@@ -273,16 +294,17 @@ public final class LootSpawner {
             return;
         }
         GamePhase phase = GameManager.INSTANCE.getPhase();
-        if (phase != GamePhase.PREPARING && phase != GamePhase.FLIGHT && phase != GamePhase.RUNNING) {
+        // 物资只允许从 FLIGHT 开始生成；PREPARING 绝不消费生成队列。
+        if (phase != GamePhase.FLIGHT && phase != GamePhase.RUNNING) {
             return; // 双保险：正常生命周期里离开本局已 stop()
         }
-        // 扫描器异步读磁盘；这里每 tick 在服务端主线程推进全图预铺，不再等待玩家加载区块。
+        // 扫描器异步读磁盘；这里每 tick 在服务端主线程最多推进 3 个箱子。
         preloadTick(server);
     }
 
     /**
-     * 开局全图预铺：扫描点一到达主线程，就强制加载其区块并立即放置箱子。
-     * 不再使用随机撒点、玩家附近加载判断或两秒一次的定时器。
+     * 开局全图预铺：扫描点进入队列后，由服务端 tick 逐个消费。
+     * 每 tick 严格受 {@link #PRELOAD_BATCH_PER_TICK} 限制，避免一次性放置大量箱子阻塞主线程。
      */
     private void preloadTick(MinecraftServer server) {
         for (DimRuntime runtime : runtimes.values()) {
@@ -499,17 +521,17 @@ public final class LootSpawner {
         }
         runtime.diagRounds = 0;
         int[] d = runtime.diag;
-        BattleRoyaleMod.LOGGER.info("[BR-LOOT-DIAG] 地图 {} 近 {} 轮（{} 秒）：成功放置箱子数 {} | 有效尝试 {} | {} | "
+        BattleRoyaleMod.LOGGER.info("[BR-LOOT-DIAG] 地图 {} 近 {} 秒：成功放置箱子数 {} | 有效尝试 {} | {} | "
                         + "因未加载跳过数 {} | 因空间不符跳过数 {} | 坐标或区块已占用 {} | 下方非实体 {} | "
-                        + "旧自然方块计数 {} | 空间被占 {} | 异常 {}",
-                runtime.map.mapId, DIAG_REPORT_ROUNDS,
-                DIAG_REPORT_ROUNDS * SPAWN_INTERVAL_TICKS / 20,
+                        + "旧自然方块计数 {} | 空间被占 {} | 异常 {}（预铺进度 {} / {}，每 tick 最多 {} 箱）",
+                runtime.map.mapId, DIAG_REPORT_ROUNDS / 20,
                 d[DIAG_SPAWNED], d[DIAG_ATTEMPTED],
                 runtime.library.isEmpty()
                         ? "刷新点库尚未产出（撒点兜底模式）"
                         : "刷新点库 " + runtime.library.size() + " 点（抽点模式）",
                 d[DIAG_CHUNK], d[DIAG_NO_SPACE], d[DIAG_DUP], d[DIAG_NOT_SOLID],
-                d[DIAG_NATURAL], d[DIAG_BLOCKED], d[DIAG_ERROR]);
+                d[DIAG_NATURAL], d[DIAG_BLOCKED], d[DIAG_ERROR],
+                runtime.count, runtime.cap, PRELOAD_BATCH_PER_TICK);
         java.util.Arrays.fill(d, 0);
     }
 

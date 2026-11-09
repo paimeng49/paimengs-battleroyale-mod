@@ -537,7 +537,8 @@ public final class MatchTeamManager {
      * RUNNING 后第 1 个 tick 就误判"冠军产生"直接 ENDED。
      */
     public boolean isMatchDecided() {
-        return active && startedTeamCount >= 2 && aliveTeamCount() <= 1;
+        // 单队测试局也应在 RUNNING 首个 tick 进入结算；无队伍则不判定。
+        return active && startedTeamCount >= 1 && aliveTeamCount() <= 1;
     }
 
     /** [BR-WINGUARD] 开局分发出去的 MatchTeam 总数（未开局为 0），供结算/日志用。 */

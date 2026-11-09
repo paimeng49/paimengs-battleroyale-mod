@@ -95,7 +95,7 @@ public final class MapEditMarker {
                 continue;
             }
             BlockPos pos = spawn.blockPos();
-            world.sendParticles(player, ParticleTypes.END_ROD, true,
+            world.sendParticles(player, ParticleTypes.END_ROD, false,
                     pos.getX() + 0.5D, pos.getY() + 0.5D, pos.getZ() + 0.5D,
                     4, 0.2D, 0.2D, 0.2D, 0.0D);
         }
@@ -125,11 +125,11 @@ public final class MapEditMarker {
         int minY = world.getMinBuildHeight();
         int maxY = world.getMaxBuildHeight();
         for (int y = minY; y < maxY; y += 4) {
-            world.sendParticles(player, ParticleTypes.END_ROD, true,
+            world.sendParticles(player, ParticleTypes.END_ROD, false,
                     x + 0.5, y + 0.5, z + 0.5, 1, 0.0, 0.2, 0.0, 0.0);
         }
         BlockPos sample = new BlockPos(x, Math.min(world.getMaxBuildHeight() - 1, Math.max(world.getMinBuildHeight(), (int) player.getY())), z);
-        world.sendParticles(player, ParticleTypes.END_ROD, true,
+        world.sendParticles(player, ParticleTypes.END_ROD, false,
                 sample.getX() + 0.5, sample.getY() + 1.0, sample.getZ() + 0.5, 2, 0.05, 0.4, 0.05, 0.0);
     }
 }

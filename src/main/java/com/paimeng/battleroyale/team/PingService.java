@@ -1,6 +1,7 @@
 package com.paimeng.battleroyale.team;
 
 import com.paimeng.battleroyale.BattleRoyaleMod;
+import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.network.PingSync;
 import com.paimeng.battleroyale.util.BrText;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -68,6 +69,12 @@ public final class PingService {
         // (MinecraftServer, ServerPlayer, ServerPlayNetworkHandler, FriendlyByteBuf, PacketSender)
         ServerPlayNetworking.registerGlobalReceiver(
                 PingSync.PING_CHANNEL_ID, (server, player, handler, buf, responseSender) -> {
+                    // 服务端第一道硬闸门：大厅及其他维度的标点包一律丢弃，绝不解析或广播。
+                    if (!GameWorldManager.isGameWorld(player.level().dimension())) {
+                        BattleRoyaleMod.LOGGER.warn("拒绝非比赛维度的标点包: player={}, dimension={}",
+                                player.getGameProfile().getName(), player.level().dimension().location());
+                        return;
+                    }
                     PingSync.PingRequest request;
                     try {
                         request = PingSync.decodePingRequest(buf);

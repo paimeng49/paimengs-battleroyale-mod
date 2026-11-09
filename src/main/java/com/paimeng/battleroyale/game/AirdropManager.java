@@ -406,8 +406,11 @@ public final class AirdropManager {
             // 让玩家能在天上看到"有条发光的东西正在缓降"，也便于确认投放确实发生了。
             if ((world.getGameTime() & 7L) == 0L) {
                 try {
-                    world.sendParticles(ParticleTypes.END_ROD,
-                            crate.x, crate.y, crate.z, 5, 0.15, 0.3, 0.15, 0.02);
+                    for (ServerPlayer viewer : world.getPlayers(p -> p.distanceToSqr(crate.x, crate.y, crate.z)
+                            <= 64.0D * 64.0D)) {
+                        world.sendParticles(viewer, ParticleTypes.END_ROD, false,
+                                crate.x, crate.y, crate.z, 5, 0.15, 0.3, 0.15, 0.02);
+                    }
                 } catch (Throwable ignored) {
                     // 粒子失败不影响下落
                 }
@@ -587,8 +590,12 @@ public final class AirdropManager {
                 double cx = beam.pos.getX() + 0.5;
                 double cz = beam.pos.getZ() + 0.5;
                 for (int y = beam.pos.getY() + 2; y <= 310; y += 4) {
-                    world.sendParticles(ParticleTypes.END_ROD, cx, y, cz, 2,
-                            0.05, 0.0, 0.05, 0.0);
+                    final int particleY = y;
+                    for (ServerPlayer viewer : world.getPlayers(p ->
+                            p.distanceToSqr(cx, particleY, cz) <= 64.0D * 64.0D)) {
+                        world.sendParticles(viewer, ParticleTypes.END_ROD, false, cx, particleY, cz, 2,
+                                0.05, 0.0, 0.05, 0.0);
+                    }
                 }
             } catch (Throwable ignored) {
                 // 粒子发不出去绝不影响对局

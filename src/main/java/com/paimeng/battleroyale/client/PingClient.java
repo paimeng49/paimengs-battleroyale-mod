@@ -1,5 +1,6 @@
 package com.paimeng.battleroyale.client;
 
+import com.paimeng.battleroyale.map.GameWorldManager;
 import com.paimeng.battleroyale.network.PingSync;
 import com.paimeng.battleroyale.team.PingType;
 import com.paimeng.battleroyale.util.BrText;
@@ -56,6 +57,17 @@ public final class PingClient {
     }
 
     private static void onClientTick(Minecraft client) {
+        // 维度硬闸门：大厅及其他维度不进入双击计时，也不发送标点包。
+        if (client.level == null || client.player == null
+                || !GameWorldManager.isGameWorld(client.level.dimension())) {
+            firstPressAtMs = -1L;
+            if (pingKey != null) {
+                while (pingKey.consumeClick()) {
+                    // 丢弃非比赛维度里积压的按键事件，避免进比赛维度后误触发。
+                }
+            }
+            return;
+        }
         if (pingKey != null) {
             while (pingKey.consumeClick()) {
                 long now = System.currentTimeMillis();
@@ -80,7 +92,8 @@ public final class PingClient {
     /** 算准星位置并发 C2S 标点包，服务端校验后才有队友可见的效果。 */
     private static void sendPing(Minecraft client, PingType type) {
         LocalPlayer player = client.player;
-        if (player == null || client.level == null) {
+        if (player == null || client.level == null
+                || !GameWorldManager.isGameWorld(client.level.dimension())) {
             return;
         }
         try {

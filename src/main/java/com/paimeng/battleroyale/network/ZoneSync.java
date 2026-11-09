@@ -47,8 +47,10 @@ public final class ZoneSync {
 
     /** 没有任何毒圈在跑时的哨兵广播间隔：每秒一次，兜住「错过 stop 那次补发」的极端情况。 */
     private static final int IDLE_KEEPALIVE_INTERVAL_TICKS = GameRules.TICKS_PER_SECOND;
+    private static final int ACTIVE_SYNC_INTERVAL_TICKS = 5;
 
     private static int idleKeepaliveTicks = 0;
+    private static int activeSyncTicks = 0;
 
     private ZoneSync() {
     }
@@ -69,7 +71,7 @@ public final class ZoneSync {
 
     /**
      * 挂在 {@code ServerTickEvents.END_SERVER_TICK} 上，每个 tick 被调用一次。
-     * 对局进行中（有任何运行时）按需求每 tick 全员同步；没开局时每秒一次 IDLE 兜底。
+     * 连续收缩阶段每 5 tick 同步一次，阶段切换由 ZoneManager 的 publish 立即触发；没开局时每秒一次 IDLE 兜底。
      */
     public static void tick(MinecraftServer server) {
         if (server == null) {
@@ -77,9 +79,13 @@ public final class ZoneSync {
         }
         if (ZoneManager.INSTANCE.anyActive()) {
             idleKeepaliveTicks = 0;
-            syncNow(server);       // 收缩中每 tick 都发，墙 / 进度条才顺滑
+            if (++activeSyncTicks >= ACTIVE_SYNC_INTERVAL_TICKS) {
+                activeSyncTicks = 0;
+                syncNow(server);       // 客户端按进度插值，5 tick 一次足够平滑
+            }
             return;
         }
+        activeSyncTicks = 0;
         if (idleKeepaliveTicks-- <= 0) {
             syncNow(server);
             idleKeepaliveTicks = IDLE_KEEPALIVE_INTERVAL_TICKS;
@@ -102,7 +108,9 @@ public final class ZoneSync {
         if (zone != null && snapshot.zoneTtkSeconds() > 0.0) {
             dps = player.getMaxHealth() / snapshot.zoneTtkSeconds();
         }
-        ServerPlayNetworking.send(player, CHANNEL_ID, encode(snapshot.withDamagePerSecond(dps)));
+        FriendlyByteBuf encoded = encode(snapshot.withDamagePerSecond(dps));
+        NetworkTrafficMonitor.record(encoded);
+        ServerPlayNetworking.send(player, CHANNEL_ID, encoded);
     }
 
     /** 进服补发：玩家刚连接时调一次，立刻拿到所在维度的毒圈状态（或 IDLE）。 */

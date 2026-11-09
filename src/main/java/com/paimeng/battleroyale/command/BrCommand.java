@@ -11,6 +11,7 @@ import com.paimeng.battleroyale.game.DownedManager;
 import com.paimeng.battleroyale.game.GameManager;
 import com.paimeng.battleroyale.game.GamePhase;
 import com.paimeng.battleroyale.game.LootSpawner;
+import com.paimeng.battleroyale.game.SettlementNotifier;
 import com.paimeng.battleroyale.game.WarmupManager;
 import com.paimeng.battleroyale.item.SelectionToolItem;
 import com.paimeng.battleroyale.item.ModItems;
@@ -97,7 +98,9 @@ public final class BrCommand {
                                 .then(Commands.literal("loot")
                                         .executes(ctx -> debugLoot(ctx.getSource())))
                                  .then(Commands.literal("tploot")
-                                         .executes(ctx -> debugTeleportLoot(ctx.getSource()))))
+                                         .executes(ctx -> debugTeleportLoot(ctx.getSource())))
+                                 .then(Commands.literal("win")
+                                         .executes(ctx -> debugWin(ctx.getSource()))))
                         .then(Commands.literal("team")
                                 .then(Commands.literal("create")
                                         .executes(ctx -> teamCreate(ctx.getSource())))
@@ -557,6 +560,19 @@ public final class BrCommand {
         player.teleportTo((ServerLevel) player.level(), target.getX() + 0.5D,
                 target.getY() + 2.0D, target.getZ() + 0.5D, player.getYRot(), player.getXRot());
         source.sendSuccess(() -> BrText.of("已传送到第一个物资箱上方。"), false);
+        return SUCCESS;
+    }
+
+    /** /paimengmods br debug win：强制触发“大吉大利，今晚吃鸡”结算流程。 */
+    private static int debugWin(CommandSourceStack source) {
+        SettlementNotifier.INSTANCE.debugForceWin(source.getServer(), source.getPlayer());
+        boolean activeMatch = GameManager.INSTANCE.getPhase().isActiveMatch();
+        if (activeMatch) {
+            GameManager.INSTANCE.requestStop(source.getServer());
+            source.sendSuccess(() -> BrText.of("已强制触发吃鸡结算流程：Title + 烟花，8 秒后传送回大厅并重置地图。"), false);
+        } else {
+            source.sendSuccess(() -> BrText.of("当前不在进行中的对局，仅演示吃鸡 Title 与烟花；开局后执行可看到 8 秒倒计时传送与地图重置。"), false);
+        }
         return SUCCESS;
     }
 

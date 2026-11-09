@@ -2,7 +2,10 @@ package com.paimeng.battleroyale.mixin;
 
 import com.paimeng.battleroyale.client.ClientDownedState;
 import com.paimeng.battleroyale.client.ClientMatchRoster;
+import com.paimeng.battleroyale.client.ClientTeamState;
+import com.paimeng.battleroyale.client.ClientTeammatePosState;
 import com.paimeng.battleroyale.client.TeamHudRenderer;
+import net.minecraft.client.Minecraft;
 import com.paimeng.battleroyale.network.DownedSyncPayload;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -35,6 +38,8 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
  *       ——拾取提示（看向物品时的名字）不受任何影响；</li>
  *   <li>查 {@link ClientMatchRoster}：座号 0（大厅阶段 / 未参赛者 / NPC）
  *       直接放行，名字维持原样——[BR-NOLOBBYNUMBER] 的渲染侧执行点；</li>
+ *   <li>只装饰当前 MatchTeam 的队友；敌队玩家即便存在于全量花名册，也绝不能显示
+ *       {@code [N号]} 前缀或队伍色；</li>
  *   <li>格式 {@code [1号] 玩家名}：{@code [N号]} 按座号固定色上色
  *       （1 黄 / 2 橙 / 3 蓝 / 4 绿，复用 {@link TeamHudRenderer#colorOf}），
  *       名字部分保留原版颜色；</li>
@@ -69,6 +74,14 @@ public abstract class NameTagRenderMixin {
         if (!(entity instanceof Player) || name == null) {
             return name;
         }
+        Minecraft client = Minecraft.getInstance();
+        Player localPlayer = client.player;
+        // 仅给本地玩家当前 MatchTeam 的队友装饰编号。敌方玩家（即便在花名册里）、
+        // 无队玩家以及玩家自己，都保持原版名字。
+        if (localPlayer == null || entity.getUUID().equals(localPlayer.getUUID())
+                || !battleroyale$isVisibleTeammate(entity.getUUID())) {
+            return name;
+        }
         int seat = ClientMatchRoster.seatOf(entity.getUUID());
         if (seat <= 0) {
             // 大厅阶段 / 未参赛者：维持原样，绝不显示局内编号。
@@ -84,5 +97,19 @@ public abstract class NameTagRenderMixin {
         MutableComponent prefix = Component.literal("[" + seat + "号]")
                 .withStyle(style -> style.withColor(TextColor.fromRgb(seatColor)));
         return prefix.append(Component.literal(" ")).append(body);
+    }
+
+    private static boolean battleroyale$isVisibleTeammate(java.util.UUID target) {
+        if (ClientTeamState.isMatch()) {
+            for (var member : ClientTeamState.members()) {
+                if (member.playerId().equals(target)) {
+                    return true;
+                }
+            }
+            // 当前队伍快照明确不是目标所在的队，不能误标成队友。
+            return false;
+        }
+        // 兼容 TeamSync 尚未到达但服务端坐标同步已经建立的短暂窗口。
+        return ClientTeammatePosState.contains(target);
     }
 }

@@ -25,7 +25,8 @@ public final class GameRules {
     public static final int MATCH_MAX_SECONDS = 20 * 60;
     public static final int MATCH_MAX_TICKS = MATCH_MAX_SECONDS * TICKS_PER_SECOND;
 
-    /** 结束后的结算展示时长：15 秒，之后自动回到大厅。 */
-    public static final int ENDED_RESET_SECONDS = 15;
+    /** 结束后的结算展示时长：8 秒（160 tick）。期间聊天栏每 2 秒提示重置倒计时，
+     *  倒计时结束后强制全员传送回主世界（大厅）并触发地图区块安全重置。 */
+    public static final int ENDED_RESET_SECONDS = 8;
     public static final int ENDED_RESET_TICKS = ENDED_RESET_SECONDS * TICKS_PER_SECOND;
 }

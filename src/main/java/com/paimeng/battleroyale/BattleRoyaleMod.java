@@ -123,7 +123,7 @@ public final class BattleRoyaleMod implements ModInitializer {
             }
         });
         // [BR-RESET] 模块三第 4 条：进入 ENDED（自然结算或 br stop 强停）后
-        // 5 秒执行安全重置（倒计时由下方 tick 驱动）。
+        // 8 秒倒计时后执行安全重置（倒计时由下方 tick 驱动）。
         bus.subscribe(GameStateChangedEvent.class, MatchResetManager.INSTANCE::onGameStateChanged);
 
         // 2) 指令注册。
@@ -148,7 +148,7 @@ public final class BattleRoyaleMod implements ModInitializer {
         // [r149 MEDICAL 模块二] 医疗物品移速加成（能量饮料 / 止痛药）到期自动摘除。
         ServerTickEvents.END_SERVER_TICK.register(
                 com.paimeng.battleroyale.item.SpeedBoostManager::tick);
-        // [BR-RESET] 进入 ENDED 后 5 秒安全重置：全员回主世界 + 清维度实体/死亡箱 +
+        // [BR-RESET] 进入 ENDED 后 8 秒安全重置：全员回主世界 + 清维度实体/死亡箱 +
         // 安全卸载游戏维度（region 文件保留，下局重新实例化）。
         ServerTickEvents.END_SERVER_TICK.register(MatchResetManager.INSTANCE::tick);
         // [BR-LOOT 模块二] 服务端主线程每 tick 推进开局全图预铺（异步扫描器只负责找点）。
@@ -166,6 +166,8 @@ public final class BattleRoyaleMod implements ModInitializer {
         ModEntities.register();
         // 4) 毒圈状态推给客户端（客户端据此画蓝色能量墙，见 client.ZoneWallRenderer）。
         ServerTickEvents.END_SERVER_TICK.register(ZoneSync::tick);
+        // [BR-NET] 每 5 秒输出模组自定义包的发送量，便于定位上行带宽热点。
+        ServerTickEvents.END_SERVER_TICK.register(com.paimeng.battleroyale.network.NetworkTrafficMonitor::tick);
 
         // 5) 队伍系统：玩家断线 = 自动离队（服务端不留"幽灵队员"，
         //    离队引发的同步包由 TeamManager 当场发给剩下的队友）；
@@ -611,8 +613,12 @@ public final class BattleRoyaleMod implements ModInitializer {
                     "【大逃杀】状态: " + event.from().displayName() + " -> " + event.to().displayName());
         }
 
-        // 普通物资箱从 PREPARING 就开始全图预铺，确保玩家跳伞前已经摆好。
+        // 准备阶段必须保持出生岛干净：只停止并清理上一局物资，不启动扫描或生成。
         if (event.to() == GamePhase.PREPARING) {
+            com.paimeng.battleroyale.game.LootSpawner.INSTANCE.prepareForNewMatch(event.server());
+        }
+        // 严格从 FLIGHT 第一 tick 开始扫描并预铺全图物资；玩家上飞机后才允许出现箱子。
+        if (event.to() == GamePhase.FLIGHT) {
             com.paimeng.battleroyale.game.LootSpawner.INSTANCE.start(event.server());
         }
         if (event.to() == GamePhase.RUNNING) {
@@ -624,7 +630,7 @@ public final class BattleRoyaleMod implements ModInitializer {
             com.paimeng.battleroyale.game.LootSpawner.INSTANCE.stop(event.server());
         }
         if ((event.from() == GamePhase.PREPARING || event.from() == GamePhase.FLIGHT)
-                && event.to() != GamePhase.RUNNING) {
+                && event.to() != GamePhase.FLIGHT && event.to() != GamePhase.RUNNING) {
             com.paimeng.battleroyale.game.LootSpawner.INSTANCE.stop(event.server());
         }
     }

@@ -51,7 +51,12 @@ public final class StatsManager {
     public void sendTo(ServerPlayer player) {
         StatsSync.sendTo(player, new StatsSyncPayload(
                 alivePlayers.size(), MatchTeamManager.INSTANCE.aliveTeamCount(),
-                kills.getOrDefault(player.getUUID(), 0)));
+                killsOf(player.getUUID())));
+    }
+
+    /** 当前玩家本局击杀数，供结算 Title 使用。 */
+    public int killsOf(UUID playerId) {
+        return playerId == null ? 0 : kills.getOrDefault(playerId, 0);
     }
 
     /** 兼容旧入口：正式淘汰统一由 DownedManager 调用。 */

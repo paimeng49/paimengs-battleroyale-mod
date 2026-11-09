@@ -24,8 +24,9 @@ import java.util.UUID;
  *   <li>淘汰提示（ActionBar）：被淘汰后仍有队友存活 →
  *       "您的队友仍在战斗，你仍有机会获取最终胜利！"；队伍全灭 →
  *       "您的队伍已被全部淘汰。"；</li>
- *   <li>前三名：存活队伍数从 >3 降为 3 的瞬间，给全部存活队员发 Title 副标题
- *       "已进入前三名！本局比赛已胜利，请继续角逐冠军！"；</li>
+ *   <li>前三名：每次淘汰后重算存活队伍数，只要降到 3 支或更少即触发一次
+ *       Title 副标题 "已进入前三名！本局比赛已胜利，请继续角逐冠军！"
+ *       （top3Shown 防重，一局只播一次）；</li>
  *   <li>吃鸡结算：存活队伍数降为 1（开局 >=2 队才算真冠军）→
  *       冠军队 Title "大吉大利，今晚吃鸡！" + 挑战完成音效（ui.toast.challenge_complete），
  *       全服聊天播报。</li>
@@ -89,16 +90,19 @@ public final class SettlementNotifier {
             return; // 本局未激活
         }
         int prev = lastAliveTeams;
-        lastAliveTeams = alive;
-        if (prev <= 0) {
-            return; // 首条事件只记基线
+        // 第一条淘汰事件的上一状态就是开局队伍数，不能只记基线后返回，
+        // 否则 4→3、2→1 的关键提示会被永远吞掉。
+        if (prev < 0) {
+            prev = MatchTeamManager.INSTANCE.startedTeamCount();
         }
-        if (!top3Shown && alive == 3 && prev > 3) {
+        lastAliveTeams = alive;
+        // 口径：存活队伍数 <= 3 即触发前三提示（一次团灭跨多级也能命中），
+        // top3Shown 防重，一局只播一次。
+        if (!top3Shown && alive <= 3) {
             top3Shown = true;
             announceTop3(server);
         }
-        if (!winnerShown && alive == 1 && prev > 1
-                && MatchTeamManager.INSTANCE.startedTeamCount() >= 2) {
+        if (!winnerShown && alive == 1 && prev > 1) {
             winnerShown = true;
             announceWinner(server);
         }
@@ -107,20 +111,55 @@ public final class SettlementNotifier {
     public void onGameStateChanged(GameStateChangedEvent event) {
         if (event.to() == GamePhase.PREPARING) {
             resetMatchState();
+        } else if (event.to() == GamePhase.ENDED
+                && !winnerShown
+                && MatchTeamManager.INSTANCE.aliveTeamCount() == 1) {
+            // 单队测试局没有淘汰事件，RUNNING 首 tick 直接结束时在这里补发吃鸡 Title。
+            winnerShown = true;
+            announceWinner(event.server());
         }
+    }
+
+    /** 调试入口：强制走吃鸡 Title，并由调用方继续触发 ENDED→RESETTING 清理。 */
+    public void debugForceWin(MinecraftServer server, ServerPlayer requestedPlayer) {
+        if (server == null) {
+            return;
+        }
+        List<ServerPlayer> targets = new ArrayList<>();
+        if (requestedPlayer != null) {
+            targets.add(requestedPlayer);
+        } else {
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                if (com.paimeng.battleroyale.util.BrText.inGameWorld(player)) {
+                    targets.add(player);
+                }
+            }
+        }
+        if (targets.isEmpty()) {
+            return;
+        }
+        winnerShown = true;
+        top3Shown = true;
+        VictoryFireworks.INSTANCE.start(targets);
+        for (ServerPlayer target : targets) {
+            sendTitle(target, "大吉大利，今晚吃鸡！", ChatFormatting.GOLD,
+                    "本局击杀数：" + StatsManager.INSTANCE.killsOf(target.getUUID()), ChatFormatting.YELLOW);
+            target.playSound(SoundEvents.UI_TOAST_CHALLENGE_COMPLETE, 1.0f, 1.0f);
+        }
+        BrText.broadcast(server, "【大逃杀】调试结算：已强制触发吃鸡流程。");
     }
 
     // ------------------------------------------------------------------
     // 播报实现
     // ------------------------------------------------------------------
 
-    /** 前三名：给全部存活队员发 Title 副标题。 */
+    /** 前三名：给全部存活队员发 Title 副标题（需求口径：前三为白色）。 */
     private void announceTop3(MinecraftServer server) {
         for (MatchTeam team : aliveTeams(server)) {
             for (ServerPlayer member : onlineMembers(server, team)) {
                 sendTitle(member,
-                        "#" + team.getTeamNumber() + "队 进入前三！", ChatFormatting.GOLD,
-                        "已进入前三名！本局比赛已胜利，请继续角逐冠军！", ChatFormatting.YELLOW);
+                        "#" + team.getTeamNumber() + "队 进入前三！", ChatFormatting.WHITE,
+                        "已进入前三名！本局比赛已胜利，请继续角逐冠军！", ChatFormatting.WHITE);
             }
         }
     }
@@ -138,7 +177,7 @@ public final class SettlementNotifier {
         VictoryFireworks.INSTANCE.start(championMembers);
         for (ServerPlayer member : championMembers) {
             sendTitle(member, "大吉大利，今晚吃鸡！", ChatFormatting.GOLD,
-                    "#" + champion.getTeamNumber() + "队 是本局的冠军！", ChatFormatting.YELLOW);
+                    "本局击杀数：" + StatsManager.INSTANCE.killsOf(member.getUUID()), ChatFormatting.YELLOW);
             member.playSound(SoundEvents.UI_TOAST_CHALLENGE_COMPLETE, 1.0f, 1.0f);
         }
     }
